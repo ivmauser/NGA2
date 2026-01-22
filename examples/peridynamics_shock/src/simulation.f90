@@ -1,12 +1,12 @@
 !> Various definitions and tools for running an NGA2 simulation
 module simulation
    use precision,         only: WP
-   use geometry,          only: cfg,Rcyl
+   use geometry,          only: cfg
    use spcomp_class,      only: spcomp
-   use gp_class,          only: gpibm
+   use lss_class,         only: lss
    use timetracker_class, only: timetracker
-   use timer_class,       only: timer
    use ensight_class,     only: ensight
+   use partmesh_class,    only: partmesh
    use event_class,       only: event
    use monitor_class,     only: monitor
    implicit none
@@ -14,42 +14,35 @@ module simulation
    
    !> Get a couple linear solvers, an incompressible flow solver and corresponding time tracker
    type(spcomp),      public :: fs
-   type(gpibm),       public :: gp
+   type(lss),         public :: ls
    type(timetracker), public :: time
    
    !> Ensight postprocessing
-   type(ensight) :: ens_out
-   type(event)   :: ens_evt
+   type(partmesh) :: pmesh
+   type(ensight)  :: ens_out
+   type(event)    :: ens_evt
    
    !> Simulation monitor file
-   type(monitor) :: mfile,cflfile,consfile,ibmfile
-
-   !> Timing info
-   type(monitor) :: timefile !< Timing monitoring
-   type(timer)   :: tstep    !< Timer for step
-   type(timer)   :: tibm     !< Timer for IBM
-   type(timer)   :: tcom     !< Timer for solver
+   type(monitor) :: mfile,cflfile,consfile,sfile
    
    public :: simulation_init,simulation_run,simulation_final
    
    !> Private work arrays
    real(WP), dimension(:,:,:,:,:), allocatable :: dQdt
+   real(WP), dimension(:,:,:,:)  , allocatable :: srcQ
    real(WP), dimension(:,:,:)    , allocatable :: Ui,Vi,Wi,Ma,beta,visc,visc_t,div
 
-   !> Constant kinematic viscosity
+   !> Post-shock viscosity and temperature
    real(WP) :: visc0,T0
 
    !> Equations of state
    real(WP) :: Pinf,Gamma,Cv,Prandtl
 
    !> Flow parameters
-   real(WP) :: Ms,Xs
+   real(WP) :: Ms,Xs,Rcyl
    real(WP) :: rho1,p1,u1,M1
    real(WP) :: rho2,p2,u2,M2
    real(WP) :: Re
-
-   !> IBM parameters
-   real(WP), dimension(3) :: ibm_force
    
  contains
 
@@ -139,242 +132,22 @@ module simulation
    end subroutine get_div
 
 
-   !> Compute force on cylinder
-   subroutine get_force()
-     use mathtools, only: Pi
-     use mpi_f08,  only: MPI_SUM,MPI_ALLREDUCE,MPI_IN_PLACE
-     use parallel, only: MPI_REAL_WP
-     implicit none
-     integer :: i,j,k,n,ierr
-     real(WP) :: div,Fl,Fr,vol
-     real(WP), dimension(:,:,:,:), allocatable :: FQx,FQy,FQz
-
-     allocate(FQx(fs%cfg%imino_:fs%cfg%imaxo_,fs%cfg%jmino_:fs%cfg%jmaxo_,fs%cfg%kmino_:fs%cfg%kmaxo_,1:3)); FQx=0.0_WP
-     allocate(FQy(fs%cfg%imino_:fs%cfg%imaxo_,fs%cfg%jmino_:fs%cfg%jmaxo_,fs%cfg%kmino_:fs%cfg%kmaxo_,1:3)); FQy=0.0_WP
-     allocate(FQz(fs%cfg%imino_:fs%cfg%imaxo_,fs%cfg%jmino_:fs%cfg%jmaxo_,fs%cfg%kmino_:fs%cfg%kmaxo_,1:3)); FQz=0.0_WP
-
-     ! Compute cell-centered momentum fluxes
-     do k=fs%cfg%kmin_-1,fs%cfg%kmax_
-        do j=fs%cfg%jmin_-1,fs%cfg%jmax_
-           do i=fs%cfg%imin_-1,fs%cfg%imax_
-              div=fs%dxi*(fs%U(i+1,j,k)-fs%U(i,j,k))+fs%dyi*(fs%V(i,j+1,k)-fs%V(i,j,k))+fs%dzi*(fs%W(i,j,k+1)-fs%W(i,j,k))
-              FQx(i,j,k,1)=2.0_WP*fs%VISC(i,j,k)*fs%dxi*(fs%U(i+1,j,k)-fs%U(i,j,k))+(fs%BETA(i,j,k)-2.0_WP*fs%VISC(i,j,k)/3.0_WP)*div-fs%P(i,j,k)
-              FQy(i,j,k,2)=2.0_WP*fs%VISC(i,j,k)*fs%dyi*(fs%V(i,j+1,k)-fs%V(i,j,k))+(fs%BETA(i,j,k)-2.0_WP*fs%VISC(i,j,k)/3.0_WP)*div-fs%P(i,j,k)
-              FQz(i,j,k,3)=2.0_WP*fs%VISC(i,j,k)*fs%dzi*(fs%W(i,j,k+1)-fs%W(i,j,k))+(fs%BETA(i,j,k)-2.0_WP*fs%VISC(i,j,k)/3.0_WP)*div-fs%P(i,j,k)
-           end do
-        end do
-     end do
-
-     ! Compute edge-centered momentum viscous fluxes and corresponding viscous heating
-     do k=fs%cfg%kmin_,fs%cfg%kmax_+1
-        do j=fs%cfg%jmin_,fs%cfg%jmax_+1
-           do i=fs%cfg%imin_,fs%cfg%imax_+1
-              FQy(i,j,k,1)=0.25_WP*sum(fs%VISC(i-1:i,j-1:j,k))*(fs%dyi*(fs%U(i,j,k)-fs%U(i,j-1,k))+fs%dxi*(fs%V(i,j,k)-fs%V(i-1,j,k))); FQx(i,j,k,2)=FQy(i,j,k,1)
-              FQz(i,j,k,2)=0.25_WP*sum(fs%VISC(i,j-1:j,k-1:k))*(fs%dzi*(fs%V(i,j,k)-fs%V(i,j,k-1))+fs%dyi*(fs%W(i,j,k)-fs%W(i,j-1,k))); FQy(i,j,k,3)=FQz(i,j,k,2)
-              FQx(i,j,k,3)=0.25_WP*sum(fs%VISC(i-1:i,j,k-1:k))*(fs%dxi*(fs%W(i,j,k)-fs%W(i-1,j,k))+fs%dzi*(fs%U(i,j,k)-fs%U(i,j,k-1))); FQz(i,j,k,1)=FQx(i,j,k,3)
-           end do
-        end do
-     end do
-
-     do i=1,3
-        call fs%cfg%sync(FQx(:,:,:,i))
-        call fs%cfg%sync(FQy(:,:,:,i))
-        call fs%cfg%sync(FQz(:,:,:,i))
-     end do
-     
-     ! Get effective volume
-     vol=1.0_WP
-     if (fs%cfg%nx.gt.1) vol=vol*fs%dx
-     if (fs%cfg%ny.gt.1) vol=vol*fs%dy
-     if (fs%cfg%nz.gt.1) vol=vol*fs%dz
-
-     ! Sum up force
-     ibm_force=0.0_WP
-     do k=cfg%kmin_,cfg%kmax_
-        do j=cfg%jmin_,cfg%jmax_
-           do i=cfg%imin_,cfg%imax_
-              if (cfg%Gib(i,j,k).lt.0.0_WP) then
-                 ! Force in x
-                 Fl=fs%dxi*(FQx(i  ,j,k,1)-FQx(i-1,j,k,1))+fs%dyi*(FQy(i  ,j+1,k,1)-FQy(i  ,j,k,1))+fs%dzi*(FQz(i  ,j,k+1,1)-FQz(i  ,j,k,1))
-                 Fr=fs%dxi*(FQx(i+1,j,k,1)-FQx(i  ,j,k,1))+fs%dyi*(FQy(i+1,j+1,k,1)-FQy(i+1,j,k,1))+fs%dzi*(FQz(i+1,j,k+1,1)-FQz(i+1,j,k,1))
-                 ibm_force(1)=ibm_force(1)+0.5_WP*(Fl+Fr)*vol
-                 ! Force in y
-                 Fl=fs%dxi*(FQx(i+1,j  ,k,2)-FQx(i,j  ,k,2))+fs%dyi*(FQy(i,j  ,k,2)-FQy(i,j-1,k,2))+fs%dzi*(FQz(i,j  ,k+1,2)-FQz(i,j  ,k,2))
-                 Fr=fs%dxi*(FQx(i+1,j+1,k,2)-FQx(i,j+1,k,2))+fs%dyi*(FQy(i,j+1,k,2)-FQy(i,j  ,k,2))+fs%dzi*(FQz(i,j+1,k+1,2)-FQz(i,j+1,k,2))
-                 ibm_force(2)=ibm_force(2)+0.5_WP*(Fl+Fr)*vol
-                 ! Force in z
-                 Fl=fs%dxi*(FQx(i+1,j,k  ,3)-FQx(i,j,k  ,3))+fs%dyi*(FQy(i,j+1,k  ,3)-FQy(i,j,k  ,3))+fs%dzi*(FQz(i,j,k  ,3)-FQz(i,j,k-1,3))
-                 FR=fs%dxi*(FQx(i+1,j,k+1,3)-FQx(i,j,k+1,3))+fs%dyi*(FQy(i,j+1,k+1,3)-FQy(i,j,k+1,3))+fs%dzi*(FQz(i,j,k+1,3)-FQz(i,j,k  ,3))
-                 ibm_force(3)=ibm_force(3)+0.5_WP*(Fl+Fr)*vol
-              end if
-           end do
-        end do
-     end do
-     call MPI_ALLREDUCE(MPI_IN_PLACE,ibm_force,3,MPI_REAL_WP,MPI_SUM,cfg%comm,ierr)
-
-     ! Deallocate flux arrays
-     deallocate(FQx,FQy,FQz)
-   end subroutine get_force
-
-
-   !> Overwrite ghostpoints to enforce BC at the cylinder
-   subroutine apply_ibm()
-     use gp_class, only: dirichlet,neumann
-     implicit none
-     integer :: i,j,k,n
-     ! Recompute primitive variables
-     call fs%get_primitive()
-     ! Reset interior points
-     do k=cfg%kmin_,cfg%kmax_
-        do j=cfg%jmin_,cfg%jmax_
-           do i=cfg%imin_,cfg%imax_
-              if (cfg%Gib(i,j,k).lt.0.0_WP) then
-                 fs%Q(i,j,k,1)=rho1
-                 fs%P(i,j,k)  =p1
-                 fs%I(i,j,k)  =get_I(rho1,p1)
-                 fs%Q(i,j,k,2)=rho1*fs%I(i,j,k)
-              end if
-              if (0.5_WP*(cfg%Gib(i-1,j,k)+cfg%Gib(i,j,k)).lt.0.0_WP) fs%U(i,j,k)=u1
-              if (0.5_WP*(cfg%Gib(i,j-1,k)+cfg%Gib(i,j,k)).lt.0.0_WP) fs%V(i,j,k)=0.0_WP
-              if (0.5_WP*(cfg%Gib(i,j,k-1)+cfg%Gib(i,j,k)).lt.0.0_WP) fs%W(i,j,k)=0.0_WP
-           end do
-        end do
-     end do
-     ! Overwrite primitive variables
-     call gp%apply_bcond(type=dirichlet,BP=0.0_WP,A=fs%U,dir='U')
-     call gp%apply_bcond(type=dirichlet,BP=0.0_WP,A=fs%V,dir='V')
-     call gp%apply_bcond(type=dirichlet,BP=0.0_WP,A=fs%W,dir='W')
-     call gp%apply_bcond(type=neumann,  BP=0.0_WP,A=fs%P,dir='SC')
-     call gp%apply_bcond(type=neumann,  BP=0.0_WP,A=fs%T,dir='SC')
-     ! Rebuild conserved quantities in the ghost cells
-     do n=1,gp%ngp
-        i=gp%gp(n)%ind(1); j=gp%gp(n)%ind(2); k=gp%gp(n)%ind(3)
-        fs%Q(i,j,k,1)=get_RHO(fs%T(i,j,k),fs%P(i,j,k))
-        fs%I(i,j,k)=get_I(fs%Q(i,j,k,1),fs%P(i,j,k))
-        fs%Q(i,j,k,2)=fs%Q(i,j,k,1)*fs%I(i,j,k)
-     end do
-     ! Communicate
-     call fs%cfg%sync(fs%U)
-     call fs%cfg%sync(fs%V)
-     call fs%cfg%sync(fs%W)
-     call fs%cfg%sync(fs%P)
-     call fs%cfg%sync(fs%I)
-     call fs%cfg%sync( fs%Q(:,:,:,1))
-     call fs%cfg%sync( fs%Q(:,:,:,2))
-     call fs%get_momentum()
-   end subroutine apply_ibm
-
-
    !> Apply boundary conditions
    subroutine apply_bconds()
-     use messager, only: die
      implicit none
      integer :: i,j,k
-     real(WP) :: rho_int,p_int,u_int,c_int,M_int
-     real(WP) :: rho_inf,p_inf,u_inf,c_inf,s_inf
-     real(WP) :: Rminus,Rplus,u_bc,c_bc,p_bc,rho_bc
 
-     ! Apply characteristic-based far-field (inflow) at x-
-     if (.not.fs%cfg%xper.and.fs%cfg%iproc.eq.1) then
-        ! Far-field reference state (post-shock)
-        rho_inf=rho2; p_inf=p2; u_inf=u2
-        c_inf=sqrt(Gamma*p_inf/rho_inf)
-        do k=fs%cfg%kmino_,fs%cfg%kmaxo_; do j=fs%cfg%jmino_,fs%cfg%jmaxo_
-           ! Interior state just inside boundary (cell centered)
-           rho_int=fs%Q(fs%cfg%imin,j,k,1)
-           p_int=fs%P(fs%cfg%imin,j,k)
-           u_int=0.5_WP*(fs%U(fs%cfg%imin,j,k)+fs%U(fs%cfg%imin+1,j,k))
-           c_int=sqrt(Gamma*p_int/rho_int)
-           M_int=abs(u_int)/c_int
-           if (u_int.ge.0.0_WP) then
-              ! ---------- INFLOW (flow entering from left) ----------
-              if (M_int.lt.1.0_WP) then
-                 ! Subsonic inflow
-                 Rplus  = u_inf + 2.0_WP*c_inf/(Gamma-1.0_WP)  ! Incoming
-                 Rminus = u_int - 2.0_WP*c_int/(Gamma-1.0_WP)  ! Outgoing
-                 u_bc = 0.5_WP*(Rplus + Rminus)
-                 c_bc = 0.25_WP*(Gamma-1.0_WP)*(Rplus - Rminus)
-                 c_bc = max(c_bc, epsilon(1.0_WP))
-                 p_bc = p_inf*(c_bc/c_inf)**(2.0_WP*Gamma/(Gamma-1.0_WP))
-                 rho_bc = Gamma*p_bc/c_bc**2
-              else
-                 ! Supersonic inflow: impose all far-field values
-                 u_bc   = u_inf
-                 c_bc   = c_inf
-                 p_bc   = p_inf
-                 rho_bc = rho_inf
-              endif
-           else
-              ! ---------- OUTFLOW (reflected wave leaving through left) ----------
-              if (M_int .lt. 1.0_WP) then
-                 ! Subsonic outflow: allow wave to exit
-                 ! For LEFT boundary outflow, characteristics are reversed
-                 Rplus  = u_int + 2.0_WP*c_int/(Gamma-1.0_WP)  ! Outgoing (left)
-                 Rminus = u_inf - 2.0_WP*c_inf/(Gamma-1.0_WP)  ! Incoming (right)
-                 u_bc = 0.5_WP*(Rplus + Rminus)
-                 c_bc = 0.25_WP*(Gamma-1.0_WP)*(Rplus - Rminus)
-                 c_bc = max(c_bc,epsilon(1.0_WP))
-                 ! For outflow, specify back pressure
-                 s_inf = p_inf/rho_inf**Gamma
-                 p_bc = p_inf
-                 rho_bc = (p_bc/s_inf)**(1.0_WP/Gamma)
-              else
-                 ! Supersonic outflow: extrapolate interior
-                 u_bc   = u_int
-                 c_bc   = c_int
-                 p_bc   = p_int
-                 rho_bc = rho_int
-              endif
-           endif
-           if (rho_bc.le.0.0_WP.or.p_bc.le.0.0_WP) call die('[apply_bconds] unphysical BC')
-           ! Copy over from imin to imin-1 and below
-           do i=fs%cfg%imino,fs%cfg%imin-1
-              ! Copy primitive variables
-              fs%Q(i,j,k,1)=rho_bc
-              fs%P(i,j,k)=p_bc
-              fs%I(i,j,k)=get_I(rho_bc,p_bc)
-              fs%U(i,j,k)=u_bc
-              fs%V(i,j,k)=fs%V(fs%cfg%imin,j,k)
-              fs%W(i,j,k)=fs%W(fs%cfg%imin,j,k)
-           end do
-        end do; end do
-     end if
-
-     ! Apply characteristic-based far-field (outflow) at x+
+     ! Apply clipped Neumann on primitive variables in x+
      if (.not.fs%cfg%xper.and.fs%cfg%iproc.eq.fs%cfg%npx) then
-        ! Far-field reference state (pre-shock)
-        rho_inf=rho1; p_inf=p1; u_inf=u1
-        c_inf=sqrt(Gamma*p_inf/rho_inf)
         do k=fs%cfg%kmino_,fs%cfg%kmaxo_; do j=fs%cfg%jmino_,fs%cfg%jmaxo_
-           ! Interior state just inside boundary (cell centered)
-           rho_int=fs%Q(fs%cfg%imax,j,k,1)
-           p_int=fs%P(fs%cfg%imax,j,k)
-           u_int=0.5_WP*(3.0_WP*fs%U(fs%cfg%imax,j,k)-fs%U(fs%cfg%imax-1,j,k))
-           c_int=sqrt(Gamma*p_int/rho_int)
-           if(abs(u_int)/c_int.lt.1.0_WP) then
-              ! Riemann invariants
-              Rplus  = u_int + 2.0_WP*c_int/(Gamma-1.0_WP)
-              Rminus = u_inf - 2.0_wp*c_inf/(Gamma-1.0_WP)
-              u_bc = 0.5_WP*(Rplus + Rminus)
-              c_bc = 0.25_WP*(Gamma-1.0_WP)*(Rplus - Rminus)
-              c_bc=max(c_bc,epsilon(1.0_WP))
-              p_bc = p_inf*(c_bc/c_inf)**(2.0_WP*Gamma/(Gamma-1.0_WP))
-              rho_bc = Gamma*p_bc/c_bc**2
-              if (rho_bc.le.0.0_WP.or.p_bc.le.0.0_WP) call die('[apply_bconds] unphysical BC')
-           else
-              ! Supersonic: all characteristics leaving, resort to Neumann
-              u_bc   = u_int
-              c_bc   = c_int
-              p_bc   = p_int
-              rho_bc = rho_int
-           endif
            ! Copy over from imax to imax+1 and above
            do i=fs%cfg%imax+1,fs%cfg%imaxo
               ! Copy primitive variables
-              fs%Q(i,j,k,1)=rho_bc
-              fs%P(i,j,k)=p_bc
-              fs%I(i,j,k)=get_I(rho_bc,p_bc)
-              fs%U(i,j,k)=u_bc
+              ls%VF(i,j,k)=ls%VF(fs%cfg%imax,j,k)
+              fs%Q(i,j,k,1)=fs%Q(fs%cfg%imax,j,k,1)
+              fs%P(i,j,k)=fs%P(fs%cfg%imax,j,k)
+              fs%I(i,j,k)=fs%I(fs%cfg%imax,j,k)
+              fs%U(i,j,k)=max(fs%U(fs%cfg%imax,j,k),0.0_WP)
               fs%V(i,j,k)=fs%V(fs%cfg%imax,j,k)
               fs%W(i,j,k)=fs%W(fs%cfg%imax,j,k)
            end do
@@ -387,6 +160,7 @@ module simulation
            ! Copy over from jmax to jmax+1 and above
            do j=fs%cfg%jmax+1,fs%cfg%jmaxo
               ! Copy primitive variables
+              ls%VF(i,j,k)=ls%VF(i,fs%cfg%jmax,k)
               fs%Q(i,j,k,1)=fs%Q(i,fs%cfg%jmax,k,1)
               fs%P(i,j,k)=fs%P(i,fs%cfg%jmax,k)
               fs%I(i,j,k)=fs%I(i,fs%cfg%jmax,k)
@@ -405,6 +179,7 @@ module simulation
            ! Then copy over from jmin to jmin-1 and below
            do j=fs%cfg%jmino,fs%cfg%jmin-1
               ! Copy primitive variables
+              ls%VF(i,j,k)=ls%VF(i,fs%cfg%jmin,k)
               fs%Q(i,j,k,1)=fs%Q(i,fs%cfg%jmin,k,1)
               fs%P(i,j,k)=fs%P(i,fs%cfg%jmin,k)
               fs%I(i,j,k)=fs%I(i,fs%cfg%jmin,k)
@@ -415,12 +190,13 @@ module simulation
         end do; end do
      end if
 
-     ! Apply clipped Neumann on primitive variables in z+
+      ! Apply clipped Neumann on primitive variables in z+
      if (.not.fs%cfg%zper.and.fs%cfg%kproc.eq.fs%cfg%npz) then
         do j=fs%cfg%jmino_,fs%cfg%jmaxo_; do i=fs%cfg%imino_,fs%cfg%imaxo_
            ! Copy over from kmax to kmax+1 and above
            do k=fs%cfg%kmax+1,fs%cfg%kmaxo
               ! Copy primitive variables
+              ls%VF(i,j,k)=ls%VF(i,j,fs%cfg%kmax)
               fs%Q(i,j,k,1)=fs%Q(i,j,fs%cfg%kmax,1)
               fs%P(i,j,k)=fs%P(i,j,fs%cfg%kmax)
               fs%I(i,j,k)=fs%I(i,j,fs%cfg%kmax)
@@ -439,6 +215,7 @@ module simulation
            ! Then copy over from kmin to kmin-1 and below
            do k=fs%cfg%kmino,fs%cfg%kmin-1
               ! Copy primitive variables
+              ls%VF(i,j,k)=ls%VF(i,j,fs%cfg%kmin)
               fs%Q(i,j,k,1)=fs%Q(i,j,fs%cfg%kmin,1)
               fs%P(i,j,k)=fs%P(i,j,fs%cfg%kmin)
               fs%I(i,j,k)=fs%I(i,j,fs%cfg%kmin)
@@ -470,15 +247,16 @@ module simulation
 
       ! Allocate work arrays
       allocate_work_arrays: block
-        allocate(dQdt(cfg%imino_:cfg%imaxo_,cfg%jmino_:cfg%jmaxo_,cfg%kmino_:cfg%kmaxo_,1:fs%nQ,1:4))
-        allocate(Ui  (cfg%imino_:cfg%imaxo_,cfg%jmino_:cfg%jmaxo_,cfg%kmino_:cfg%kmaxo_))
-        allocate(Vi  (cfg%imino_:cfg%imaxo_,cfg%jmino_:cfg%jmaxo_,cfg%kmino_:cfg%kmaxo_))
-        allocate(Wi  (cfg%imino_:cfg%imaxo_,cfg%jmino_:cfg%jmaxo_,cfg%kmino_:cfg%kmaxo_))
-        allocate(Ma  (cfg%imino_:cfg%imaxo_,cfg%jmino_:cfg%jmaxo_,cfg%kmino_:cfg%kmaxo_))
-        allocate(beta(cfg%imino_:cfg%imaxo_,cfg%jmino_:cfg%jmaxo_,cfg%kmino_:cfg%kmaxo_))
-        allocate(visc(cfg%imino_:cfg%imaxo_,cfg%jmino_:cfg%jmaxo_,cfg%kmino_:cfg%kmaxo_))
+        allocate(dQdt  (cfg%imino_:cfg%imaxo_,cfg%jmino_:cfg%jmaxo_,cfg%kmino_:cfg%kmaxo_,1:fs%nQ,1:4))
+        allocate(srcQ  (cfg%imino_:cfg%imaxo_,cfg%jmino_:cfg%jmaxo_,cfg%kmino_:cfg%kmaxo_,1:fs%nQ))
+        allocate(Ui    (cfg%imino_:cfg%imaxo_,cfg%jmino_:cfg%jmaxo_,cfg%kmino_:cfg%kmaxo_))
+        allocate(Vi    (cfg%imino_:cfg%imaxo_,cfg%jmino_:cfg%jmaxo_,cfg%kmino_:cfg%kmaxo_))
+        allocate(Wi    (cfg%imino_:cfg%imaxo_,cfg%jmino_:cfg%jmaxo_,cfg%kmino_:cfg%kmaxo_))
+        allocate(Ma    (cfg%imino_:cfg%imaxo_,cfg%jmino_:cfg%jmaxo_,cfg%kmino_:cfg%kmaxo_))
+        allocate(beta  (cfg%imino_:cfg%imaxo_,cfg%jmino_:cfg%jmaxo_,cfg%kmino_:cfg%kmaxo_))
+        allocate(visc  (cfg%imino_:cfg%imaxo_,cfg%jmino_:cfg%jmaxo_,cfg%kmino_:cfg%kmaxo_))
         allocate(visc_t(cfg%imino_:cfg%imaxo_,cfg%jmino_:cfg%jmaxo_,cfg%kmino_:cfg%kmaxo_))
-        allocate(div(cfg%imino_:cfg%imaxo_,cfg%jmino_:cfg%jmaxo_,cfg%kmino_:cfg%kmaxo_))
+        allocate(div   (cfg%imino_:cfg%imaxo_,cfg%jmino_:cfg%jmaxo_,cfg%kmino_:cfg%kmaxo_))
       end block allocate_work_arrays
 
 
@@ -512,6 +290,7 @@ module simulation
         ! Get reference temperature based on post-shock conditions
         T0=get_T(rho2,p2)
         ! Define viscosity based on post-shock Reynolds number
+        call param_read('Cylinder radius',Rcyl)
         call param_read('Reynolds number',Re); visc0=rho2*2.0_WP*Rcyl*u2/Re
         ! Output case info
         if (cfg%amRoot) then
@@ -541,6 +320,137 @@ module simulation
         time%dt=time%dtmax
         time%itmax=2
       end block initialize_timetracker
+
+
+      ! Initialize Lagrangian solid solver
+      initialize_lss: block
+         real(WP) :: dx,mu,kk,max_stretch
+         integer :: np
+         
+         ! Create solver
+         ls=lss(cfg=cfg,name='solid')
+         
+         ! Set material properties
+         call param_read('Elastic Modulus',ls%elastic_modulus)
+         call param_read('Poisson Ratio',ls%poisson_ratio)
+         call param_read('Solid density',ls%rho)
+         call param_read('Critical Energy Release Rate',ls%crit_energy)
+         
+         ! Discretization
+         call param_read('Solid dx',dx)
+         ls%dV=dx**3
+         ls%delta=3.0_WP*dx
+
+         ! Output some info on stretch
+         mu=ls%elastic_modulus/(2.0_WP+2.0_WP*ls%poisson_ratio)
+         kk=ls%elastic_modulus/(3.0_WP-6.0_WP*ls%poisson_ratio)
+         max_stretch=sqrt(ls%crit_energy/((3.0_WP*mu+(kk-5.0_WP*mu/3.0_WP)*0.75_WP**4)*ls%delta))
+
+         ! Only root process initializes solid particles
+         if (ls%cfg%amRoot) then
+            ! First object =====================
+            object: block
+               integer :: p,i,j,k,nx,ny,nz,np_
+               real(WP) :: x,y,z
+               real(WP), dimension(:,:), allocatable :: pos
+               logical :: keep
+               ! Create simple rectilinear grid, remove particles outside Rcyl
+               nx=int(2.0_WP*Rcyl/dx)
+               ny=int(2.0_WP*Rcyl/dx)
+               nz=int(min(2.0_WP*Rcyl,ls%cfg%zL)/dx); if (ls%cfg%nz.eq.1) nz=1
+               np=nx*ny*nz
+               allocate(pos(3,np))
+               np_=0
+               do p=1,np
+                  ! Give temporary position
+                  i = (p-1)/(ny*nz)
+                  j = (p-1-ny*nz*i)/nz
+                  k = p-1-ny*nz*i-nz*j
+                  x = -Rcyl+(real(i,WP)+0.5_WP)*dx
+                  y = -Rcyl+(real(j,WP)+0.5_WP)*dx
+                  z = max(-Rcyl,ls%cfg%z(ls%cfg%kmin))+(real(k,WP)+0.5_WP)*dx
+                  if (ls%cfg%nz.eq.1) z = 0.0_WP
+                  keep=.false.
+                  if (ls%cfg%nz.eq.1 .and. sqrt(x**2+y**2).lt.Rcyl) keep=.true.
+                  if (ls%cfg%nz.gt.1 .and. sqrt(x**2+y**2+z**2).lt.Rcyl) keep=.true.
+                  if (keep) then
+                     np_=np_+1
+                     pos(1,np_) = x
+                     pos(2,np_) = y
+                     pos(3,np_) = z
+                  end if
+               end do
+               np=np_
+               call ls%resize(np)
+               do p=1,np
+                  ! Set position
+                  ls%p(p)%pos=pos(:,p)
+                  ! Set outward normal
+                  ls%p(p)%norm=ls%p(p)%pos/sqrt(sum(ls%p(p)%pos**2))
+                  ! Set object id and velocity
+                  ls%p(p)%id=1
+                  ls%p(p)%vel=0.0_WP
+                  ! Zero out force
+                  ls%p(p)%Abond=0.0_WP
+                  ! Locate the particle on the mesh
+                  ls%p(p)%ind=ls%cfg%get_ijk_global(ls%p(p)%pos,[ls%cfg%imin,ls%cfg%jmin,ls%cfg%kmin])
+                  ! Assign a unique integer to particle
+                  ls%p(p)%i=p
+                  ! Activate the particle
+                  ls%p(p)%flag=0
+                  ! Determine surface particles (set flag=2)
+                  if (sqrt(sum(ls%p(p)%pos**2)).gt.Rcyl-dx) ls%p(p)%flag=2
+               end do
+               deallocate(pos)
+             end block object
+          end if
+         
+         ! Communicate particles
+         call ls%sync()
+         
+         ! Get initial volume fraction
+         call ls%update_VF()
+         
+         ! Initalize bonds
+         call ls%bond_init()
+
+         if (ls%cfg%amRoot) then
+            print*,"===== Solid Setup Description ====="
+            print*,'Number of particles', np
+            print*,'Maximum stretching =',max_stretch
+         end if
+         
+      end block initialize_lss
+
+
+     ! Create partmesh object for visualizing Lagrangian particles
+      create_pmesh: block
+         use lss_class, only: max_bond
+         integer :: i,n,nbond
+         pmesh=partmesh(nvar=3,nvec=2,name='solid')
+         pmesh%varname(1)='failfrac'
+         pmesh%varname(2)='dilatation'
+         pmesh%varname(3)='flag'
+         pmesh%vecname(1)='velocity'
+         pmesh%vecname(2)='bond_force'
+         call ls%update_partmesh(pmesh)
+         do i=1,ls%np_
+            pmesh%var(1,i)=0.0_WP
+            nbond=0
+            do n=1,max_bond
+               if (ls%p(i)%ibond(n).gt.0) nbond=nbond+1
+            end do
+            if (ls%p(i)%nbond.gt.0) then
+               pmesh%var(1,i)=1.0_WP-real(nbond,WP)/real(ls%p(i)%nbond,WP)
+            else
+               pmesh%var(1,i)=0.0_WP
+            end if
+            pmesh%var(2,i)  =ls%p(i)%dil
+            pmesh%var(3,i)  =ls%p(i)%flag
+            pmesh%vec(:,1,i)=ls%p(i)%vel
+            pmesh%vec(:,2,i)=ls%p(i)%Abond
+         end do
+      end block create_pmesh
 
 
       ! Initialize variables
@@ -575,21 +485,15 @@ module simulation
       end block initialize_variables
 
 
-      ! Initialize the ghost points with 3 layers of ghost cells
-      create_gp: block
-        gp=gpibm(cfg=cfg,no=3)
-        call gp%update()
-      end block create_gp
-
-
       ! Add Ensight output
       create_ensight: block
          ! Create Ensight output from cfg
-         ens_out=ensight(cfg=cfg,name='cylinder')
+         ens_out=ensight(cfg=cfg,name='shock')
          ! Create event for Ensight output
          ens_evt=event(time=time,name='Ensight output')
          call param_read('Ensight output period',ens_evt%tper)
          ! Add variables to output
+         call ens_out%add_particle('particles',pmesh)
          call ens_out%add_vector('velocity',Ui,Vi,Wi)
          call ens_out%add_scalar('P',fs%P)
          call ens_out%add_scalar('T',fs%T)
@@ -597,9 +501,8 @@ module simulation
          call ens_out%add_scalar('beta',beta)
          call ens_out%add_scalar('visc',visc)
          call ens_out%add_scalar('visc_t',visc_t)
-         call ens_out%add_scalar('div',div)
-         call ens_out%add_scalar('Gib',cfg%Gib)
-         call ens_out%add_scalar('IBM',gp%label)
+         call ens_out%add_scalar('div',div) 
+         call ens_out%add_scalar('VFs',ls%VF)
          ! Output to ensight
          if (ens_evt%occurs()) call ens_out%write_data(time%t)
       end block create_ensight
@@ -607,9 +510,12 @@ module simulation
       
       ! Create monitor files
       create_monitor: block
-        !> Perform and output monitoring
+        real(WP) :: cfl
+        ! Prepare some info about fields
+        call ls%get_cfl(time%dt,time%cfl)
+        call fs%get_cfl(time%dt,cfl); time%cfl=max(cfl,time%cfl)
         call fs%get_info()
-        call get_force()
+        call ls%get_max()
         ! Create simulation monitor
         mfile=monitor(fs%cfg%amRoot,'simulation')
         call mfile%add_column(time%n,'Timestep number')
@@ -621,8 +527,6 @@ module simulation
         call mfile%add_column(fs%Wmax,'Wmax')
         call mfile%add_column(fs%RHOmax,'max(RHO)')
         call mfile%add_column(fs%RHOmin,'min(RHO)')
-        call mfile%add_column(fs%Imax  ,'max(I)'  )
-        call mfile%add_column(fs%Imin  ,'min(I)'  )
         call mfile%add_column(fs%Pmax  ,'max(P)'  )
         call mfile%add_column(fs%Pmin  ,'min(P)'  )
         call mfile%add_column(fs%Tmax  ,'max(T)'  )
@@ -654,31 +558,25 @@ module simulation
         call consfile%add_column(fs%RHOKint,'Kinetic Energy')
         call consfile%add_column(fs%RHOSint,'Entropy')
         call consfile%write()
-        ! Create IBM monitor
-        ibmfile=monitor(fs%cfg%amRoot,'ibm')
-        call ibmfile%add_column(time%n,'Timestep number')
-        call ibmfile%add_column(time%t,'Time')
-        call ibmfile%add_column(ibm_force(1),'X Force')
-        call ibmfile%add_column(ibm_force(2),'Y Force')
-        call ibmfile%add_column(ibm_force(3),'Z Force')
-        call ibmfile%write()
+        ! Create solid monitor
+        sfile=monitor(ls%cfg%amRoot,'solid')
+        call sfile%add_column(time%n,'Timestep number')
+        call sfile%add_column(time%t,'Time')
+        call sfile%add_column(time%dt,'Timestep size')
+        call sfile%add_column(time%cfl,'Maximum CFL')
+        call sfile%add_column(ls%np,'Particle number')
+        call sfile%add_column(ls%VFmax,'VFmax')
+        call sfile%add_column(ls%Umin,'Particle Umin')
+        call sfile%add_column(ls%Umax,'Particle Umax')
+        call sfile%add_column(ls%Vmin,'Particle Vmin')
+        call sfile%add_column(ls%Vmax,'Particle Vmax')
+        call sfile%add_column(ls%Wmin,'Particle Wmin')
+        call sfile%add_column(ls%Wmax,'Particle Wmax')
+        call sfile%add_column(ls%ibmForce(1),'Particle Fx')
+        call sfile%add_column(ls%ibmForce(2),'Particle Fy')
+        call sfile%add_column(ls%ibmForce(3),'Particle Fz')
+        call sfile%write()
       end block create_monitor
-
-
-      ! Create a timing monitor
-      create_timing: block
-        ! Create timers
-        tstep=timer(comm=cfg%comm,name='Total')
-        tibm =timer(comm=cfg%comm,name='IBM')
-        tcom =timer(comm=cfg%comm,name='Comp')
-        ! Create corresponding monitor file
-        timefile=monitor(cfg%amRoot,'timing')
-        call timefile%add_column(time%n,'Timestep number')
-        call timefile%add_column(time%t,'Time')
-        call timefile%add_column(tstep%time,trim(tstep%name))
-        call timefile%add_column(tibm%time,trim(tibm%name))
-        call timefile%add_column(tcom%time,trim(tcom%name))
-      end block create_timing
 
     end subroutine simulation_init
 
@@ -686,18 +584,14 @@ module simulation
     !> Perform an NGA2 simulation
     subroutine simulation_run
       implicit none
+      real(WP) :: cfl
 
       ! Perform time integration
       do while (.not.time%done())
 
-         ! Reset all timers and start timestep timer
-         call tstep%reset()
-         call tibm%reset()
-         call tcom%reset()
-         call tstep%start()
-
          ! Increment time
-         call fs%get_cfl(time%dt,time%cfl)
+         call ls%get_cfl(time%dt,time%cfl)
+         call fs%get_cfl(time%dt,cfl); time%cfl=max(time%cfl,cfl)
          call time%adjust_dt()
          call time%increment()
 
@@ -707,50 +601,105 @@ module simulation
          ! Prepare SGS viscosity models
          call prepare_viscosities()
 
-
          ! First RK step ====================================================================================
+         ! Advance particles
+         call ls%substep_rk4(stage =1,&
+         &                   dt    =time%dt,&
+         &                   gamma =Gamma,&
+         &                   Pinf  =Pinf,&
+         &                   U     =fs%U,&
+         &                   V     =fs%V,&
+         &                   W     =fs%W,&
+         &                   P     =fs%P,&
+         &                   RHO   =fs%Q(:,:,:,1),&
+         &                   srcRHO=srcQ(:,:,:,1),&
+         &                   srcI  =srcQ(:,:,:,2),&
+         &                   srcU  =srcQ(:,:,:,3),&
+         &                   srcV  =srcQ(:,:,:,4),&
+         &                   srcW  =srcQ(:,:,:,5))
          ! Get non-SL RHS and increment
-         call tcom%start() ! Start compressible timer
          call fs%rhs(dQdt(:,:,:,:,1))
+         ! IBM source
+         dQdt(:,:,:,:,1)=dQdt(:,:,:,:,1)+srcQ
+         ! Advance
          fs%Q=fs%Qold+0.5_WP*time%dt*dQdt(:,:,:,:,1)
-         call tcom%stop() ! Stop compressible timer
-         ! Apply IBM
-         call tibm%start() ! Start IBM timer
-         call apply_ibm()
-         call tibm%stop() ! Stop IBM timer
+         ! Recompute primitive variables
+         call fs%get_primitive()
 
          ! Second RK step ===================================================================================
+         ! Advance particles
+         call ls%substep_rk4(stage =2,&
+         &                   dt    =time%dt,&
+         &                   gamma =Gamma,&
+         &                   Pinf  =Pinf,&
+         &                   U     =fs%U,&
+         &                   V     =fs%V,&
+         &                   W     =fs%W,&
+         &                   P     =fs%P,&
+         &                   RHO   =fs%Q(:,:,:,1),&
+         &                   srcRHO=srcQ(:,:,:,1),&
+         &                   srcI  =srcQ(:,:,:,2),&
+         &                   srcU  =srcQ(:,:,:,3),&
+         &                   srcV  =srcQ(:,:,:,4),&
+         &                   srcW  =srcQ(:,:,:,5))
          ! Get non-SL RHS and increment
-         call tcom%start() ! Start compressible timer
          call fs%rhs(dQdt(:,:,:,:,2))
+         ! IBM source
+         dQdt(:,:,:,:,2)=dQdt(:,:,:,:,2)+srcQ
+         ! Advance
          fs%Q=fs%Qold+0.5_WP*time%dt*dQdt(:,:,:,:,2)
-         call tcom%stop() ! Stop compressible timer
-         ! Apply IBM
-         call tibm%start() ! Start IBM timer
-         call apply_ibm()
-         call tibm%stop() ! Stop IBM timer
+         ! Recompute primitive variables
+         call fs%get_primitive()
 
          ! Third RK step ====================================================================================
+         ! Advance particles
+         call ls%substep_rk4(stage =3,&
+         &                   dt    =time%dt,&
+         &                   gamma =Gamma,&
+         &                   Pinf  =Pinf,&
+         &                   U     =fs%U,&
+         &                   V     =fs%V,&
+         &                   W     =fs%W,&
+         &                   P     =fs%P,&
+         &                   RHO   =fs%Q(:,:,:,1),&
+         &                   srcRHO=srcQ(:,:,:,1),&
+         &                   srcI  =srcQ(:,:,:,2),&
+         &                   srcU  =srcQ(:,:,:,3),&
+         &                   srcV  =srcQ(:,:,:,4),&
+         &                   srcW  =srcQ(:,:,:,5))
          ! Get non-SL RHS and increment
-         call tcom%start() ! Start compressible timer
-         call fs%rhs(dQdt(:,:,:,:,3))
+         call fs%rhs(dQdt=dQdt(:,:,:,:,3))
+         ! IBM source
+         dQdt(:,:,:,:,3)=dQdt(:,:,:,:,3)+srcQ
+         ! Advance
          fs%Q=fs%Qold+1.0_WP*time%dt*dQdt(:,:,:,:,3)
-         call tcom%stop() ! Stop compressible timer
-         ! Apply IBM
-         call tibm%start() ! Start IBM timer
-         call apply_ibm()
-         call tibm%stop() ! Stop IBM timer
+         ! Recompute primitive variables
+         call fs%get_primitive()
 
          ! Fourth RK step ===================================================================================
+         ! Advance particles
+         call ls%substep_rk4(stage =4,&
+         &                   dt    =time%dt,&
+         &                   gamma =Gamma,&
+         &                   Pinf  =Pinf,&
+         &                   U     =fs%U,&
+         &                   V     =fs%V,&
+         &                   W     =fs%W,&
+         &                   P     =fs%P,&
+         &                   RHO   =fs%Q(:,:,:,1),&
+         &                   srcRHO=srcQ(:,:,:,1),&
+         &                   srcI  =srcQ(:,:,:,2),&
+         &                   srcU  =srcQ(:,:,:,3),&
+         &                   srcV  =srcQ(:,:,:,4),&
+         &                   srcW  =srcQ(:,:,:,5))
          ! Get non-SL RHS and increment
-         call tcom%start() ! Start compressible timer
          call fs%rhs(dQdt(:,:,:,:,4))
+         ! IBM source
+         dQdt(:,:,:,:,4)=dQdt(:,:,:,:,4)+srcQ
+         ! Advance
          fs%Q=fs%Qold+time%dt/6.0_WP*(dQdt(:,:,:,:,1)+2.0_WP*dQdt(:,:,:,:,2)+2.0_WP*dQdt(:,:,:,:,3)+dQdt(:,:,:,:,4))
-         call tcom%stop() ! Stop compressible timer
-         ! Apply IBM
-         call tibm%start() ! Start IBM timer
-         call apply_ibm()
-         call tibm%stop() ! Stop IBM timer
+         ! Recompute primitive variables
+         call fs%get_primitive()
 
          ! Apply boundary conditions
          call apply_bconds()
@@ -764,20 +713,38 @@ module simulation
          ! Compute dilatation
          call get_div()
 
-         ! Stop timestep timer
-         call tstep%stop()
-
          !> Perform and output monitoring
          call fs%get_info()
-         call get_force()
+         call ls%get_max()
          call mfile%write()
-         call timefile%write()
          call cflfile%write()
          call consfile%write()
-         call ibmfile%write()
+         call sfile%write()
 
          ! Output to ensight
-         if (ens_evt%occurs()) call ens_out%write_data(time%t)
+         if (ens_evt%occurs()) then
+            update_pmesh: block
+              use lss_class, only: max_bond
+              integer :: i,n,nbond
+              call ls%update_partmesh(pmesh)
+              do i=1,ls%np_
+                 nbond=0
+                 do n=1,max_bond
+                    if (ls%p(i)%ibond(n).gt.0) nbond=nbond+1
+                 end do
+                 if (ls%p(i)%nbond.gt.0) then
+                    pmesh%var(1,i)=1.0_WP-real(nbond,WP)/real(ls%p(i)%nbond,WP)
+                 else
+                    pmesh%var(1,i)=0.0_WP
+                 end if
+                 pmesh%var(2,i)  =ls%p(i)%dil
+                 pmesh%var(3,i)  =ls%p(i)%flag
+                 pmesh%vec(:,1,i)=ls%p(i)%vel
+                 pmesh%vec(:,2,i)=ls%p(i)%Abond
+              end do
+            end block update_pmesh
+            call ens_out%write_data(time%t)
+         end if
 
       end do
 
@@ -795,10 +762,7 @@ module simulation
       ! timetracker
       
       ! Deallocate work arrays
-      deallocate(dQdt,Ui,Vi,Wi,Ma,beta,visc,visc_t,div)
-      call tstep%finalize()
-      call tibm%finalize()
-      call tcom%finalize()
+      deallocate(dQdt,Ui,Vi,Wi,Ma,beta,visc,visc_t,div,srcQ)
       
    end subroutine simulation_final
    

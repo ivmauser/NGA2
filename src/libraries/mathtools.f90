@@ -97,8 +97,32 @@ contains
       ! Deallocate the work arrays
       deallocate(A,B)
    end subroutine fd_itp_build
-
    
+   
+   ! function inverse_matrix(A) result(Ainv)
+   !    use messager, only: die
+   !    implicit none
+   !    real(WP), dimension(:,:), intent(in) :: A
+   !    real(WP), dimension(size(A,1),size(A,2)) :: Ainv
+   !    real(WP), dimension(size(A,1)) :: work
+   !    integer , dimension(size(A,1)) :: ipiv
+   !    integer :: n,info
+   !    external DGETRF
+   !    external DGETRI
+   !    ! Copy A over to Ainv to prevent it from being overwritten by LAPACK
+   !    Ainv=A
+   !    ! Store size
+   !    n=size(A,1)
+   !    ! Compute LU factorization of matrix A using partial pivoting with row interchanges
+   !    call DGETRF(n,n,Ainv,n,ipiv,info)
+   !    ! Error handling
+   !    if (info.ne.0) call die('[inverse_matrix] Matrix is numerically singular')
+   !    ! Compute inverse of matrix using LU factorization computed above
+   !    call DGETRI(n,Ainv,n,ipiv,work,n,info)
+   !    if (info.ne.0) call die('[inverse_matrix] Matrix inversion failed')
+   !  end function inverse_matrix
+   
+
    !> Computes the inverse of a square matrix A
    function inverse_matrix(A) result(Ainv)
      use messager,only:die
@@ -110,7 +134,7 @@ contains
      integer::i,j,n,pivot
      real(WP)::maxA,factor
      n=size(A,1)
-     if(size(A,2).ne.n)call die('[inverse_matrix] Matrix is not square')
+     if (size(A,2).ne.n) call die('[inverse_matrix] Matrix is not square')
      A_=A
      Ainv=0.0_WP
      do i=1,n
@@ -125,7 +149,7 @@ contains
               pivot=j
            end if
         end do
-        if(pivot.ne.i)then
+        if (pivot.ne.i) then
            row_temp=A_(i,:)
            A_(i,:)=A_(pivot,:)
            A_(pivot,:)=row_temp
@@ -133,19 +157,18 @@ contains
            Ainv(i,:)=Ainv(pivot,:)
            Ainv(pivot,:)=row_temp
         end if
-        if(abs(A_(i,i)).lt.epsilon(A_(i,i)))call die('[inverse_matrix] Matrix is numerically singular')
+        if (abs(A_(i,i)).lt.1.0e-12_WP) call die('[inverse_matrix] Matrix is numerically singular')
         factor=A_(i,i)
         A_(i,:)=A_(i,:)/factor
         Ainv(i,:)=Ainv(i,:)/factor
         do j=1,n
-           if(j.ne.i)then
+           if (j.ne.i) then
               factor=A_(j,i)
               A_(j,:)=A_(j,:)-factor*A_(i,:)
               Ainv(j,:)=Ainv(j,:)-factor*Ainv(i,:)
            end if
         end do
      end do
-     Ainv=transpose(Ainv)
    end function inverse_matrix
    
    

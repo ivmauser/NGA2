@@ -1,16 +1,17 @@
 !> Various definitions and tools for initializing NGA2 config
 module geometry
-   use config_class, only: config
-   use precision,    only: WP
+   use config_class,   only: config
+   use precision,      only: WP
    implicit none
    private
    
    !> Single config
    type(config), public :: cfg
-   
+
    public :: geometry_init
    
 contains
+   
    
    !> Initialization of problem geometry
    subroutine geometry_init
@@ -19,21 +20,22 @@ contains
       implicit none
       type(sgrid) :: grid
       
+      
       ! Create a grid from input params
       create_grid: block
          use sgrid_class, only: cartesian
          integer :: i,j,k,nx,ny,nz
          real(WP) :: Lx,Ly,Lz
          real(WP), dimension(:), allocatable :: x,y,z
+         
          ! Read in grid definition
          call param_read('Lx',Lx); call param_read('nx',nx); allocate(x(nx+1))
          call param_read('Ly',Ly); call param_read('ny',ny); allocate(y(ny+1))
          call param_read('Lz',Lz); call param_read('nz',nz); allocate(z(nz+1))
-         ! Handle 2D case
-         if (nz.eq.1) Lz=Lx/real(nx,WP)
+         
          ! Create simple rectilinear grid
          do i=1,nx+1
-            x(i)=real(i-1,WP)/real(nx,WP)*Lx
+            x(i)=real(i-1,WP)/real(nx,WP)*Lx-0.25_WP*Lx
          end do
          do j=1,ny+1
             y(j)=real(j-1,WP)/real(ny,WP)*Ly-0.5_WP*Ly
@@ -41,9 +43,12 @@ contains
          do k=1,nz+1
             z(k)=real(k-1,WP)/real(nz,WP)*Lz-0.5_WP*Lz
          end do
-         ! General serial grid object
-         grid=sgrid(coord=cartesian,no=2,x=x,y=y,z=z,xper=.false.,yper=.true.,zper=.true.,name='vdjet')
+         
+         ! General serial grid object (no=3 needed to support ghost/image point interpolation/extrapolation)
+         grid=sgrid(coord=cartesian,no=3,x=x,y=y,z=z,xper=.false.,yper=.true.,zper=.true.,name='box')
+         
       end block create_grid
+      
       
       ! Create a config from that grid on our entire group
       create_cfg: block
@@ -55,11 +60,14 @@ contains
          cfg=config(grp=group,decomp=partition,grid=grid)
       end block create_cfg
       
-      ! Create masks for this config
+      
+      ! Create walls for this config
       create_walls: block
-         cfg%VF=1.0_WP
+        cfg%VF=1.0_WP
       end block create_walls
       
+      
    end subroutine geometry_init
+   
    
 end module geometry

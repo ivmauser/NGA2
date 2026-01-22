@@ -100,6 +100,7 @@ module df_class
       procedure :: setup_obj                              !< Setup IBM object
       procedure :: get_source                             !< Compute direct forcing source
       procedure :: advance                                !< Step forward the particle ODEs
+      procedure :: rotate                                 !< Solid body rotation
       procedure :: resize                                 !< Resize particle array to given size
       procedure :: recycle                                !< Recycle particle array by removing flagged particles
       procedure :: sync                                   !< Synchronize particles across interprocessor boundaries
@@ -467,7 +468,7 @@ contains
       implicit none
       class(dfibm), intent(inout) :: this
       real(WP), intent(inout) :: dt  !< Timestep size over which to advance
-      integer :: i,j,k,ierr
+      integer :: i,ierr
       real(WP) :: mydt,dt_done
       type(part) :: myp
       
@@ -524,6 +525,95 @@ contains
       end block logging
       
    end subroutine advance
+
+
+   !> Advance the marker particles based on solid body rotation
+   subroutine rotate(this,dt,omega,axis)
+     use mpi_f08, only : MPI_SUM,MPI_INTEGER
+     use mathtools, only: arctan
+      implicit none
+      class(dfibm), intent(inout) :: this
+      real(WP), intent(in) :: dt     !< Timestep size over which to advance
+      real(WP), intent(in) :: omega  !< Rotation rate
+      character(len=1), intent(in) :: axis !< Axis of rotation
+      integer :: i,j
+      real(WP) :: mydt,dt_done,r,theta,x0,y0,z0,dx,dy,dz
+
+      if (.not.this%can_move) return
+      
+      ! Advance the equations
+      do i=1,this%np_
+         ! Avoid particles with id=0
+         if (this%p(i)%id.eq.0) cycle
+         ! Determine associated object
+         j=int(this%p(i)%id)
+         ! Store original position
+         x0=this%p(i)%pos(1)
+         y0=this%p(i)%pos(2)
+         z0=this%p(i)%pos(3)
+         ! Relative position
+         dx=x0-this%o(j)%pos(1)
+         dy=y0-this%o(j)%pos(2)
+         dz=z0-this%o(j)%pos(3)
+         ! Rotate about the prescribed axis
+         select case (trim(adjustl(axis)))
+         case ('x')
+            ! Rotate about the x-axis
+            r = sqrt(dy**2 + dz**2)
+            theta = arctan(dy, dz) + omega*dt
+            this%p(i)%pos(2) = this%o(j)%pos(2) + r*cos(theta)
+            this%p(i)%pos(3) = this%o(j)%pos(3) + r*sin(theta)
+            this%p(i)%vel(1) = 0.0_WP
+            this%p(i)%vel(2) = -omega*dz
+            this%p(i)%vel(3) =  omega*dy
+         case('y')
+            ! Rotate about the y-axis
+            r = sqrt(dx**2 + dz**2)
+            theta = arctan(dx, dz) + omega*dt
+            this%p(i)%pos(1) = this%o(j)%pos(1) + r*cos(theta)
+            this%p(i)%pos(3) = this%o(j)%pos(3) + r*sin(theta)
+            this%p(i)%vel(1) =  omega*dz
+            this%p(i)%vel(2) = 0.0_WP
+            this%p(i)%vel(3) = -omega*dx
+         case('z')
+            ! Rotate about the z-axis
+            r = sqrt(dx**2 + dy**2)
+            theta = arctan(dx, dy) + omega*dt
+            this%p(i)%pos(1) = this%o(j)%pos(1) + r*cos(theta)
+            this%p(i)%pos(2) = this%o(j)%pos(2) + r*sin(theta)
+            this%p(i)%vel(1) = -omega*dy
+            this%p(i)%vel(2) =  omega*dx
+            this%p(i)%vel(3) = 0.0_WP
+         end select
+         ! Correct the position to take into account periodicity
+         if (this%cfg%xper) this%p(i)%pos(1)=this%cfg%x(this%cfg%imin)+modulo(this%p(i)%pos(1)-this%cfg%x(this%cfg%imin),this%cfg%xL)
+         if (this%cfg%yper) this%p(i)%pos(2)=this%cfg%y(this%cfg%jmin)+modulo(this%p(i)%pos(2)-this%cfg%y(this%cfg%jmin),this%cfg%yL)
+         if (this%cfg%zper) this%p(i)%pos(3)=this%cfg%z(this%cfg%kmin)+modulo(this%p(i)%pos(3)-this%cfg%z(this%cfg%kmin),this%cfg%zL)
+         ! Relocalize the particle
+         this%p(i)%ind=this%cfg%get_ijk_global(this%p(i)%pos,this%p(i)%ind)
+      end do
+      
+      ! Communicate particles
+      call this%sync()
+      
+      ! Recompute volume fraction
+      call this%update_VF()
+      
+      ! Log/screen output
+      logging: block
+         use, intrinsic :: iso_fortran_env, only: output_unit
+         use param,    only: verbose
+         use messager, only: log
+         use string,   only: str_long
+         character(len=str_long) :: message
+         if (this%cfg%amRoot) then
+            write(message,'("dfibm rotation [",a,"] on partitioned grid [",a,"]: ",i0," particles were advanced")') trim(this%name),trim(this%cfg%name),this%np
+            if (verbose.gt.1) write(output_unit,'(a)') trim(message)
+            if (verbose.gt.0) call log(message)
+         end if
+      end block logging
+      
+   end subroutine rotate
 
 
    !> Calculate the CFL
