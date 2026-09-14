@@ -6,7 +6,7 @@ module lsspd_class
    use config_class,   only: config
    use ddadi_class,    only: ddadi
    use mpi_f08,        only: MPI_Datatype,MPI_INTEGER8,MPI_INTEGER,MPI_DOUBLE_PRECISION
-   use pdsolver_class, only: pdsolver, PDC_IS_DEAD, PDC_BONDS, PDC_INTEGRATES, PDC_MOVES, pd_partition
+   use NOSB_class,     only: pdsolver, PDC_IS_DEAD, PDC_BONDS, PDC_INTEGRATES, PDC_MOVES, pd_partition
    implicit none
    private
    

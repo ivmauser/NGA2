@@ -29,7 +29,7 @@
 !> communicated -- and a single halo reduce assembles cross-rank pairs.
 !> Kernels are pure loops over owned nodes with no mutable module-level
 !> state (OpenMP-ready by construction; threads deferred).
-module pdsolver_class
+module NOSB_class
    use precision,        only: WP,I8
    use string,           only: str_medium
    use pdhalo_class,     only: pddir,pdhalo,sort3_perm,PDHALO_KEY0
@@ -161,6 +161,7 @@ module pdsolver_class
       real(WP) :: wtmax_kick=0.0_WP,wtmax_halo=0.0_WP,wtmax_dil=0.0_WP,wtmax_force=0.0_WP,wtmax_reduce=0.0_WP
       real(WP) :: wtmax_contact=0.0_WP,wtmax_broad=0.0_WP
       real(WP) :: wtmin_dil=0.0_WP,wtmin_force=0.0_WP
+      real(WP) :: tot_time=0.0_WP,maxtot_time=0.0_WP
 
       ! Damping rate for steady state
       real(WP) :: damping_rate=0.0_WP
@@ -767,6 +768,7 @@ contains
    !> contact, second half-kick.
    subroutine pd_advance(this,dt)
       use parallel, only: parallel_time
+      use mathtools, only: Pi
       implicit none
       class(pdsolver), intent(inout) :: this
       real(WP), intent(in) :: dt
@@ -777,10 +779,13 @@ contains
       logical :: plastic,do_j2
       real(WP), dimension(3) :: acc,dxv,fx
       real(WP), dimension(3,3) :: K_mat,E_mat,I_mat,S_mat,K_inv,sigma, s_dev
-      real(WP) :: detK,traceE
+      real(WP) :: detK_inv,traceE
       real(WP) :: kk,mu
       real(WP), dimension(3) :: xi,rpos,z,t1,t2,tc
       integer :: i,e,j
+
+      real(WP) :: t_full
+      t_full=parallel_time()
 
       rho_inv=1.0_WP/this%rho
       mu=this%elastic_modulus/(2.0_WP+2.0_WP*this%poisson_ratio)
@@ -876,28 +881,7 @@ contains
          call this%chalo%update(this%v,3,shifted=.false.)
          this%wt_halo=this%wt_halo+(parallel_time()-t0)
       end if
-
-      ! ! Dilatation (pure gather; own family only; broken entries excluded --
-      ! ! breaks happen in the force sweep AFTER this, matching amrpd's ordering)
-      ! t0=parallel_time()
-      ! do i=1,this%nown
-      !    this%theta(i)=0.0_WP
-      !    do e=this%ptr(i),this%ptr(i+1)-1
-      !       if (this%dmg(e).ne.0_1) cycle
-      !       j=this%lst(e)
-      !       zeta=sqrt(sum((this%x0(:,j)-this%x0(:,i))**2))
-      !       dY  =sqrt(sum((this%y(:,j) -this%y(:,i) )**2))
-      !       e_b=dY-zeta
-      !       this%theta(i)=this%theta(i)+omega(zeta,this%delta)*zeta*e_b*this%vol(j)
-      !    end do
-      !    if (this%mw(i).gt.0.0_WP) then
-      !       this%theta(i)=fdim*this%theta(i)/this%mw(i)
-      !    else
-      !       this%theta(i)=0.0_WP
-      !    end if
-      ! end do
-      ! this%wt_dil=this%wt_dil+(parallel_time()-t0)
-
+      t0=parallel_time()
       ! Equivalent to the dilatation sweep from before, I think that each one needs to sweep over 
       ! and compute the tensors K_mat and F
       I_mat = 0.0_WP
@@ -928,18 +912,18 @@ contains
             this%F_mat(3,1,i)=this%F_mat(3,1,i)+rpos(3)*xi(1)*w*this%vol(j); this%F_mat(3,2,i)=this%F_mat(3,2,i)+rpos(3)*xi(2)*w*this%vol(j); this%F_mat(3,3,i)=this%F_mat(3,3,i)+rpos(3)*xi(3)*w*this%vol(j);
          end do
 
-         detK = K_mat(1,1)*(K_mat(2,2)*K_mat(3,3)-K_mat(2,3)*K_mat(3,2)) &
+         detK_inv = 1.0_WP/(K_mat(1,1)*(K_mat(2,2)*K_mat(3,3)-K_mat(2,3)*K_mat(3,2)) &
                -K_mat(1,2)*(K_mat(2,1)*K_mat(3,3)-K_mat(2,3)*K_mat(3,1)) &
-               +K_mat(1,3)*(K_mat(2,1)*K_mat(3,2)-K_mat(2,2)*K_mat(3,1))
-         K_inv(1,1) =  (K_mat(2,2)*K_mat(3,3) - K_mat(2,3)*K_mat(3,2))/detK
-         K_inv(2,1) = -(K_mat(2,1)*K_mat(3,3) - K_mat(2,3)*K_mat(3,1))/detK
-         K_inv(3,1) =  (K_mat(2,1)*K_mat(3,2) - K_mat(2,2)*K_mat(3,1))/detK
-         K_inv(1,2) = -(K_mat(1,2)*K_mat(3,3) - K_mat(1,3)*K_mat(3,2))/detK
-         K_inv(2,2) =  (K_mat(1,1)*K_mat(3,3) - K_mat(1,3)*K_mat(3,1))/detK
-         K_inv(3,2) = -(K_mat(1,1)*K_mat(3,2) - K_mat(1,2)*K_mat(3,1))/detK
-         K_inv(1,3) =  (K_mat(1,2)*K_mat(2,3) - K_mat(1,3)*K_mat(2,2))/detK
-         K_inv(2,3) = -(K_mat(1,1)*K_mat(2,3) - K_mat(1,3)*K_mat(2,1))/detK
-         K_inv(3,3) =  (K_mat(1,1)*K_mat(2,2) - K_mat(1,2)*K_mat(2,1))/detK
+               +K_mat(1,3)*(K_mat(2,1)*K_mat(3,2)-K_mat(2,2)*K_mat(3,1)))
+         K_inv(1,1) =  (K_mat(2,2)*K_mat(3,3) - K_mat(2,3)*K_mat(3,2))*detK_inv
+         K_inv(2,1) = -(K_mat(2,1)*K_mat(3,3) - K_mat(2,3)*K_mat(3,1))*detK_inv
+         K_inv(3,1) =  (K_mat(2,1)*K_mat(3,2) - K_mat(2,2)*K_mat(3,1))*detK_inv
+         K_inv(1,2) = -(K_mat(1,2)*K_mat(3,3) - K_mat(1,3)*K_mat(3,2))*detK_inv
+         K_inv(2,2) =  (K_mat(1,1)*K_mat(3,3) - K_mat(1,3)*K_mat(3,1))*detK_inv
+         K_inv(3,2) = -(K_mat(1,1)*K_mat(3,2) - K_mat(1,2)*K_mat(3,1))*detK_inv
+         K_inv(1,3) =  (K_mat(1,2)*K_mat(2,3) - K_mat(1,3)*K_mat(2,2))*detK_inv
+         K_inv(2,3) = -(K_mat(1,1)*K_mat(2,3) - K_mat(1,3)*K_mat(2,1))*detK_inv
+         K_inv(3,3) =  (K_mat(1,1)*K_mat(2,2) - K_mat(1,2)*K_mat(2,1))*detK_inv
          
          this%F_mat(:,:,i) = MATMUL(this%F_mat(:,:,i),K_inv)
          E_mat = 0.5_WP * (MATMUL(TRANSPOSE(this%F_mat(:,:,i)),this%F_mat(:,:,i))-I_mat)
@@ -947,13 +931,13 @@ contains
          S_mat = (kk-2.0_WP/3.0_WP*mu)*traceE*I_mat + 2.0_WP*mu*E_mat
          this%PK_inv(:,:,i) = MATMUL(MATMUL(this%F_mat(:,:,i),S_mat),K_inv)
       end do
-
+      this%wt_dil=this%wt_dil+(parallel_time()-t0)
       ! I think here we just need to communicate PK_inv and F_mat, everything else can stay local
-      ! t0=parallel_time()
+      t0=parallel_time()
       do e=1,3
          call this%halo%update(this%PK_inv(:,e,:),3,shifted=.false.)
       end do
-      ! this%wt_halo=this%wt_halo+(parallel_time()-t0)
+      this%wt_halo=this%wt_halo+(parallel_time()-t0)
 
       ! Node-centered force sweep: each row computes its OWN force state t
       ! (own theta, own mw) and scatters +t/-t; the neighbor's t arrives from
@@ -961,7 +945,6 @@ contains
       t0=parallel_time()
       this%f=0.0_WP
       do i=1,this%nown
-         ! if (this%mw(i).le.0.0_WP) cycle
          ! ! Per-node J2 return factor from the LAGGED family norm. With
          ! ! hardening (hard_mod>0) the surface radius grows with the node's
          ! ! accumulated equivalent plastic strain lam_p (surface lagged one
@@ -986,9 +969,6 @@ contains
          do e=this%ptr(i),this%ptr(i+1)-1                         !IVM, does this work out so that each point is visited at the main, or do we only end up visiting half??
             if (this%dmg(e).ne.0_1) cycle
             j=this%lst(e)
-            ! zeta=sqrt(sum((this%x0(:,j)-this%x0(:,i))**2))
-            ! dxv=this%y(:,j)-this%y(:,i)
-            ! dY=sqrt(sum(dxv**2))
             xi=this%x0(:,j)-this%x0(:,i)
             rpos=this%y(:,j) -this%y(:,i)
             zeta=sqrt(sum(xi**2))
@@ -1009,52 +989,18 @@ contains
                cycle
             end if
             w=omega(zeta,this%delta)
-            ! ! Deviatoric split: e_d carries this HALF-ENTRY's inelastic stretch
-            ! ! e_v (per-side history: own theta, own mw -- Peridigm form; e_v=0
-            ! ! recovers canonical elastic LPS bit-for-bit)
-            ! e_d=e_b-this%theta(i)*zeta/fdim
-            ! td=w/this%mw(i)*cdev*(e_d-this%visc_lambda*this%e_v(e))
-            ! t =w/this%mw(i)*cvol*this%theta(i)*zeta+td
-            ! ! J2 family norm: pure own-row gather (no communication)
-            ! if (do_j2) this%td2a(i)=this%td2a(i)+td*td*this%vol(j)
-            ! ! Pair contribution from THIS row's force state (Peridigm volumes:
-            ! ! +t*V_j to self, -t*V_i to the neighbor)
-            ! fx=t*dxv/dY
-            ! this%f(:,i)=this%f(:,i)+fx*this%vol(j)
-            ! this%f(:,j)=this%f(:,j)-fx*this%vol(i)
-            ! ! Per-side viscoplastic flow of e_v (exact exponential). Two yield
-            ! ! criteria, as in amrpd:
-            ! !   sigma_yield>0: J2 radial return (per-node beta computed at the
-            ! !     row head above, incl. isotropic hardening), Perzyna-
-            ! !     regularized by (1-decay); tau->0 recovers Peridigm's
-            ! !     rate-independent return.
-            ! !   else: per-bond overstress (yield_stretch=0 -> pure Maxwell).
-            ! if (plastic) then
-            !    if (do_j2) then
-            !       this%e_v(e)=this%e_v(e)+(1.0_WP-beta)*(e_d-this%e_v(e))*(1.0_WP-decay)
-            !    else
-            !       e_e=e_d-this%e_v(e)
-            !       over=abs(e_e)-this%yield_stretch*zeta
-            !       if (over.gt.0.0_WP) this%e_v(e)=this%e_v(e)+sign(over*(1.0_WP-decay),e_e)
-            !    end if
-            ! end if
-
             ! Now we compute forces, similar to before, but we only plus up the one particle instead of being slick with both 
             t1 = w*MATMUL(this%PK_inv(:,:,i),xi)                              
             ! Force density 2->1
             t2 = w*MATMUL(this%PK_inv(:,:,j),xi)    
             ! Force correction term
             z = rpos-MATMUL(this%F_mat(:,:,i),xi)
-            tc = w*(9.0_WP*kk/((3.14159265_WP) * this%delta**4))*(dot_product(xi,z)/(sqrt(dot_product(xi,xi)))**3)*xi       
+            tc = w*(9.0_WP*kk/((Pi) * this%delta**4))*(dot_product(xi,z)/(sqrt(dot_product(xi,xi)))**3)*xi       
             ! Compute bond acceleration
             this%f(:,i)=this%f(:,i)+(t1+t2+tc)*this%vol(j)
          end do
       end do
-      ! ! Publish this substep's J2 norm (read by the NEXT substep's return)
-      ! if (do_j2) then
-      !    this%td2(1:this%nown)=this%td2a(1:this%nown)
-      !    this%td2a(1:this%nown)=0.0_WP
-      ! end if
+
       this%wt_force=this%wt_force+(parallel_time()-t0)
 
       ! Assemble cross-rank pair forces (halo slots -> owners, add)
@@ -1083,6 +1029,8 @@ contains
          if (this%collapsed(3)) this%v(3,i)=0.0_WP
       end do
       this%wt_kick=this%wt_kick+(parallel_time()-t0)
+
+      this%tot_time=this%tot_time+(parallel_time()-t_full)
    end subroutine pd_advance
 
    !> Contact broad phase: displacement-triggered rebuild of the contact halo
@@ -1518,8 +1466,10 @@ contains
       call MPI_ALLREDUCE(this%wt_reduce,this%wtmax_reduce,1,MPI_REAL_WP,MPI_MAX,comm,ierr)
       call MPI_ALLREDUCE(this%wt_contact,this%wtmax_contact,1,MPI_REAL_WP,MPI_MAX,comm,ierr)
       call MPI_ALLREDUCE(this%wt_broad,  this%wtmax_broad,  1,MPI_REAL_WP,MPI_MAX,comm,ierr)
+      call MPI_ALLREDUCE(this%tot_time,  this%maxtot_time,  1,MPI_REAL_WP,MPI_MAX,comm,ierr)
+
       this%wt_kick=0.0_WP; this%wt_halo=0.0_WP; this%wt_dil=0.0_WP; this%wt_force=0.0_WP; this%wt_reduce=0.0_WP
-      this%wt_contact=0.0_WP; this%wt_broad=0.0_WP
+      this%wt_contact=0.0_WP; this%wt_broad=0.0_WP; this%tot_time=0.0_WP
       ! Contact-service size census (visibility into the fragmentation-driven
       ! degradation mode of the static graph partition)
       contact_census: block
@@ -2278,4 +2228,4 @@ contains
       nk=(-n1+128)+(-n2+128)*256+(-n3+128)*65536
    end function negkey
 
-end module pdsolver_class
+end module NOSB_class

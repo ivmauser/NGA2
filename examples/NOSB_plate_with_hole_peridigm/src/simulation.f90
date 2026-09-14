@@ -363,6 +363,24 @@ module simulation
         call sfile%add_column(ls%ibmForce(2),'Particle Fy')
         call sfile%add_column(ls%ibmForce(3),'Particle Fz')
         call sfile%write()
+
+        call ls%get_info()
+        mfile=monitor(amRoot=amRoot,name='simulation')
+        call mfile%add_column(time%n,'Timestep')
+        call mfile%add_column(time%t,'Time')
+        call mfile%add_column(ls%np,'Nodes')
+        call mfile%add_column(ls%nb,'Bonds')
+        call mfile%add_column(ls%wtmax_kick,   'kick_max')
+        call mfile%add_column(ls%wtmax_halo,   'halo_max')
+        call mfile%add_column(ls%wtmax_dil,    'dil_max')
+        call mfile%add_column(ls%wtmin_dil,    'dil_min')
+        call mfile%add_column(ls%wtmax_force,  'force_max')
+        call mfile%add_column(ls%wtmin_force,  'force_min')
+        call mfile%add_column(ls%wtmax_reduce, 'reduce_max')
+        call mfile%add_column(ls%wtmax_contact,'contact_max')
+        call mfile%add_column(ls%wtmax_broad,  'broad_max')
+        call mfile%add_column(ls%maxtot_time,  'total_max')
+        call mfile%write()
       end block create_monitor
 
       print *, '================== simulation_init COMPLETE =================='
@@ -538,6 +556,9 @@ module simulation
          ! call mfile%write()
          ! call cflfile%write()
          ! call sfile%write()
+
+         call ls%get_info()
+         call mfile%write()
          
       end do
 
