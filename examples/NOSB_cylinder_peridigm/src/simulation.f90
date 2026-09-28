@@ -5,12 +5,14 @@ module simulation
    use fft2d_class,       only: fft2d
    use ddadi_class,       only: ddadi
    use incomp_class,      only: incomp
-   use lsspd_class,       only: lss, pd_partition, PDC_MOVES,PDC_INTEGRATES,PDC_BONDS
+   use lsspd_class,       only: lss, pd_partition, PDC_MOVES,PDC_INTEGRATES,PDC_BONDS,PDC_SURFACE
    use timetracker_class, only: timetracker
    use ensight_class,     only: ensight
    use partmesh_class,    only: partmesh
    use event_class,       only: event
    use monitor_class,     only: monitor
+   use string,            only: str_medium
+   use datafile_class,    only: datafile
    implicit none
    private
    
@@ -24,10 +26,13 @@ module simulation
    !> Ensight postprocessing
    
    type(ensight) :: ens_out
-   type(event)   :: ens_evt
+   type(event)   :: ens_evt, save_evt
+   type(datafile) :: df
+   logical :: restarted = .false.
    type(partmesh),    public :: pmesh
+   character(len=str_medium) :: restart_dir
    !> Simulation monitor file
-   type(monitor) :: mfile,cflfile,sfile
+   type(monitor) :: mfile,cflfile,sfile,tfile
    
    public :: simulation_init,simulation_run,simulation_final
    
@@ -40,6 +45,10 @@ module simulation
 
    !> Max timestep size for solid solver
    real(WP) :: ls_dt,ls_dt_max
+   integer :: solid_substeps = 0
+
+   !> Steady state evolution boolean
+   logical :: steady_state = .false.
    
  contains
 
@@ -74,6 +83,15 @@ module simulation
       use parallel, only: amRoot
       implicit none
 
+      ! Initialize time tracker with 2 subiterations
+      initialize_timetracker: block
+        time=timetracker(amRoot=cfg%amRoot)
+        call param_read('Max timestep size',time%dtmax)
+        call param_read('Max cfl number',time%cflmax)
+        call param_read('Max time',time%tmax)
+        time%dt=time%dtmax
+        time%itmax=2
+      end block initialize_timetracker
 
       ! Allocate work arrays
       allocate_work_arrays: block
@@ -93,16 +111,44 @@ module simulation
          allocate(gradU(1:3,1:3,cfg%imino_:cfg%imaxo_,cfg%jmino_:cfg%jmaxo_,cfg%kmino_:cfg%kmaxo_))
       end block allocate_work_arrays
 
+      ! Handle restart/saves here
+      restart_and_save: block
+         restart_dir=''
+         ! Create event for saving restart files
+         save_evt=event(time,'Restart output')
+         call param_read('Restart output period',save_evt%tper,default=huge(1.0_WP))
+         ! Check if we are restarting
+         call param_read(tag='Restart from',val=restart_dir,short='r',default='')
+         restarted=.false.; if (len_trim(restart_dir).gt.0) restarted=.true.
+         if (restarted) then
+            ! If we are, read the name of the directory
+            call param_read('Restart from',restart_dir,'r')
+            ! Read the datafile
+            df = datafile(pg=cfg, fdata=trim(restart_dir)//'/fluid')
+         else
+            ! Prepare a new directory for storing files for restart
+            call execute_command_line('mkdir -p restart')
+            ! If we are not restarting, we will still need a datafile for saving restart files
+            df=datafile(pg=cfg,filename=trim(cfg%name),nval=4,nvar=4)
+            df%valname(1)='t'
+            df%valname(2)='dt'
+            df%valname(3)='step'
+            df%valname(4)='ls_dt'
+            df%varname(1)='U'
+            df%varname(2)='V'
+            df%varname(3)='W'
+            df%varname(4)='P'
+         end if
+      end block restart_and_save
 
-      ! Initialize time tracker with 2 subiterations
-      initialize_timetracker: block
-        time=timetracker(amRoot=cfg%amRoot)
-        call param_read('Max timestep size',time%dtmax)
-        call param_read('Max cfl number',time%cflmax)
-        call param_read('Max time',time%tmax)
-        time%dt=time%dtmax
-        time%itmax=2
-      end block initialize_timetracker
+      ! Revisit timetracker to adjust time and time step values if this is a restart
+      update_timetracker: block
+         if (restarted) then
+            call df%pullval(name='t' ,val=time%t )
+            call df%pullval(name='dt',val=time%dt)
+            time%told=time%t-time%dt
+         end if
+      end block update_timetracker
 
       ! Initialize Lagrangian solid solver
       initialize_lss: block
@@ -111,25 +157,33 @@ module simulation
          integer(I8), allocatable :: gids(:),rgid(:)
          real(WP), allocatable :: pos(:,:),vel(:,:),voll(:),rpos(:,:),rvel(:,:),rvol(:)
          integer, allocatable :: flags(:),owner(:),rflag(:)
-         integer :: i,j,k,n,nn,nr,nx,ny,nz,N_r,N_z
-         real(WP) :: dx,x0,y0,z0
-         real(WP) :: R
+         integer :: i,j,k,n,nn,nr,nx,ny,nz,N_r,N_z,bnx,bny
+         real(WP) :: dx,x0,y0,z0,Beam_L,Beam_H,Lx,Ly,Lz,x_c,y_c,a,b
+         real(WP) :: R, R_int
          real(WP) :: rho,E,nu,elem,delta
 
          ls=lss(cfg=cfg,name='solid')
-
-         call param_read('R',R,default=0.5_WP)
-         call param_read('N_r',N_r,default=10)
-         call param_read('Z ratio',N_z,default=6)
+         
+         ! Problem dimensions
+         call param_read('R',R,default=0.5_WP)        ! Cylinder radius
+         call param_read('N_r',N_r,default=10)        ! Number of particles accross cylinder radius
+         call param_read('Lz',Lz,default=6.0_WP)     ! Z dimensionality 
+         call param_read('Lx',Lx,default=2.5_WP)      ! Z length of the domain
+         call param_read('Ly',Ly,default=0.41_WP)     ! Y length of the domain
+         call param_read('x_c',x_c,default=0.2_WP)    ! x-Center of the cylinder in space (measured from lower left corner)
+         call param_read('y_c',y_c,default=0.2_WP)    ! y-Center of the cylinder in space (measured from lower left corner)
+         call param_read('a',a,default=0.35_WP)       ! Length of beam (measured from end of cylinder)
+         call param_read('b',b,default=0.02_WP)       ! Width of beam
          ! need to define an elem value
          elem=R/(3.0_WP*real(N_r,WP))
          ls%delta=elem*3.01_WP ! 3 times the elem value should be the grid spacing
-         call param_read('Material density',ls%rho,default=10.0_WP)
+         call param_read('Material density',ls%rho)
          call param_read('Elastic modulus', ls%elastic_modulus,default=2.0e11_WP)
          call param_read('Poisson ratio',   ls%poisson_ratio,default=0.3_WP)
          call param_read('Tau',             ls%tau, default=huge(1.0_WP))
          call param_read('Particle timestep size',ls_dt_max,default=huge(1.0_WP))
-         call param_read('Unfreeze time', ls%unfreeze_time,default=huge(1.0_WP))
+         call param_read('Steady state', steady_state)
+
          ls%damping_rate=0.0_WP
          ls_dt=min(ls_dt_max,time%dtmax)
          ! Configure by field assignment (grid-free: no domain, no periodicity)
@@ -138,63 +192,108 @@ module simulation
          ! simply 1..n -- any unique positive keys work)
          ! Check dimensionality
          if(cfg%nx.eq.1) ls%collapsed(1)=.true.
-         if(cfg%ny.eq.2) ls%collapsed(2)=.true.
-         if(cfg%nz.eq.3) ls%collapsed(3)=.true.
-         nx = 2*N_r*3
-         ny = 2*N_r*3
-         ! Z is special for a cylinder, needs to match width of the domain 
-         if (N_z.eq.0) then
-            nz = 1
+         if(cfg%ny.eq.1) ls%collapsed(2)=.true.
+         if(cfg%nz.eq.1) ls%collapsed(3)=.true.
+         if (restarted) then
+            call ls%read_state(dirname=trim(restart_dir))
+            ! do i=1,ls%nown
+            !    if(ls%flag(i).eq.PDC_BONDS+PDC_MOVES) ls%flag(i)=PDC_BONDS+PDC_MOVES+PDC_INTEGRATES
+            ! end do         
          else
-            nz = N_r*N_z*3
-         end if 
-         nn=0
-         if(amRoot) then
-            
+            nx = 2*N_r*3
+            ny = 2*N_r*3
+            ! Z is special for a cylinder, needs to match width of the domain 
+            if (Lz.eq.0.0_WP) then
+               nz = 1
+            else
+               nz = N_r*N_z*3
+            end if 
+            nn=0
+
+            ! Now we set up the beam
+            Beam_L = a + R
+            Beam_H = b
+            bnx = int(Beam_L/elem)
+            bny = int(Beam_H/elem)
+            R_int = R*(real(N_r-4,WP)/real(N_r,WP))
+            if(amRoot) then
+               ! Cylinder
+               do k=1,nz; do j=1,ny; do i=1,nx
+                  
+                  x0 = (real(i,WP) - 0.5_WP*real(nx+1,WP))*elem + x_c
+                  y0 = (real(j,WP) - 0.5_WP*real(ny+1,WP))*elem + y_c
+                  z0 = (real(k,WP) - 0.5_WP*real(nz+1,WP))*elem
+                  if (((x0-x_c)*(x0-x_c) + (y0-y_c)*(y0-y_c)).ge.R*R) cycle;
+                  if (((x0-x_c)*(x0-x_c) + (y0-y_c)*(y0-y_c)).le.R_int*R_int) cycle;
+                  if (((x0-x_c).gt.0.0_WP).and.(abs(y0-y_c).le.Beam_H/2.0_WP)) cycle;
+                  nn=nn+1
+               end do; end do; end do
+
+               ! Beam
+               do k=1,nz; do j=1,bny; do i=1,bnx
+                  x0 = (real(i,WP) - 0.5_WP*real(bnx+1,WP))*elem + Beam_L/2.0_WP + x_c
+                  y0 = (real(j,WP) - 0.5_WP*real(bny+1,WP))*elem + y_c
+                  z0 = (real(k,WP) - 0.5_WP*real(nz+1,WP))*elem
+                  ! if (((x0)*(x0) + y0*y0).le.R*R) cycle;
+                  nn=nn+1
+               end do; end do; end do
+
+               print*, nn
+            end if
+         
+            allocate(gids(max(nn,1)),pos(3,max(nn,1)),vel(3,max(nn,1)),flags(max(nn,1)),voll(max(nn,1)),owner(max(nn,1)))
+            ! allocate(ls%icell(3,max(nn,1)))
+            n=0
             do k=1,nz; do j=1,ny; do i=1,nx
-               
-               x0 = (real(i,WP) - 0.5_WP*real(nx+1,WP))*elem
-               y0 = (real(j,WP) - 0.5_WP*real(ny+1,WP))*elem
+               if (.not.amRoot) exit
+               x0 = (real(i,WP) - 0.5_WP*real(nx+1,WP))*elem + x_c
+               y0 = (real(j,WP) - 0.5_WP*real(ny+1,WP))*elem + y_c
                z0 = (real(k,WP) - 0.5_WP*real(nz+1,WP))*elem
-               if (((x0)*(x0) + y0*y0).ge.R*R) cycle;
-               nn=nn+1
+               if (((x0-x_c)*(x0-x_c) + (y0-y_c)*(y0-y_c)).ge.R*R) cycle;
+               if (((x0-x_c)*(x0-x_c) + (y0-y_c)*(y0-y_c)).le.R_int*R_int) cycle;
+               if (((x0-x_c).gt.0.0_WP).and.(abs(y0-y_c).le.Beam_H/2.0_WP)) cycle;
+               n=n+1
+               pos(:,n)=[x0, y0, z0]
+               vel(:,n)=[0.0_WP, 0.0_WP, 0.0_WP]
+               flags(n)= PDC_BONDS ! PDC_MOVES+PDC_INTEGRATES+PDC_BONDS !< IVM, bitwise, this should keep it still?
+               gids(n)=int(n,I8)
+               voll(n)=elem**3
             end do; end do; end do
+            print*, n
+
+         
+            do k=1,nz; do j=1,bny; do i=1,bnx
+               if (.not.amRoot) exit
+               x0 = (real(i,WP) - 0.5_WP*real(bnx+1,WP))*elem + Beam_L/2.0_WP + x_c
+               y0 = (real(j,WP) - 0.5_WP*real(bny+1,WP))*elem + y_c
+               z0 = (real(k,WP) - 0.5_WP*real(nz+1,WP))*elem
+               ! if (((x0)*(x0) + y0*y0).le.R*R) cycle;
+               n=n+1
+               pos(:,n)=[x0, y0, z0]
+               vel(:,n)=[0.0_WP, 0.0_WP, 0.0_WP]
+               flags(n)= PDC_BONDS !PDC_MOVES+PDC_INTEGRATES+PDC_BONDS !< IVM, bitwise, this should keep it still?
+               if ((x0-x_c).gt.R) flags(n)=PDC_MOVES+PDC_INTEGRATES+PDC_BONDS
+               if((j.eq.1).and.((x0-x_c).gt.R)) flags(n) = PDC_MOVES+PDC_INTEGRATES+PDC_BONDS+ PDC_SURFACE
+               if((j.eq.bny).and.((x0-x_c).gt.R)) flags(n) = PDC_MOVES+PDC_INTEGRATES+PDC_BONDS + PDC_SURFACE
+               if((i.eq.bnx).and.((x0-x_c).gt.R)) flags(n) = PDC_MOVES+PDC_INTEGRATES+PDC_BONDS + PDC_SURFACE
+               gids(n)=int(n,I8)
+               voll(n)=elem**3
+            end do; end do; end do
+            call pd_partition(nn,gids,pos,vel,flags,voll,owner,nr,rgid,rpos,rvel,rflag,rvol)
+            call ls%set_nodes(nr,rgid,rpos,rvel,rflag,rvol)
+            call ls%detect_families()
          end if
-
          
-
          
-         allocate(gids(max(nn,1)),pos(3,max(nn,1)),vel(3,max(nn,1)),flags(max(nn,1)),voll(max(nn,1)),owner(max(nn,1)))
-         ! allocate(ls%icell(3,max(nn,1)))
-         n=0
-         do k=1,nz; do j=1,ny; do i=1,nx
-            if (.not.amRoot) exit
-            x0 = (real(i,WP) - 0.5_WP*real(nx+1,WP))*elem
-            y0 = (real(j,WP) - 0.5_WP*real(ny+1,WP))*elem
-            z0 = (real(k,WP) - 0.5_WP*real(nz+1,WP))*elem
-            if (((x0)*(x0) + y0*y0).ge.R*R) cycle;
-            n=n+1
-            pos(:,n)=[x0, y0, z0]
-            vel(:,n)=[0.0_WP, 0.0_WP, 0.0_WP]
-            flags(n)= PDC_MOVES+PDC_INTEGRATES+PDC_BONDS !< IVM, bitwise, this should keep it still?
-            gids(n)=int(n,I8)
-            voll(n)=elem**3
-            ! if (i.lt.7) then; flags(n)=PDC_MOVES+PDC_BONDS; vel(:,n)=[-1.0e-3_WP, 0.0_WP, 0.0_WP]; end if
-            ! if (i.gt.nx-6) then; flags(n)=PDC_MOVES+PDC_BONDS; vel(:,n)=[1.0e-3_WP, 0.0_WP, 0.0_WP]; end if
-         end do; end do; end do
-         call pd_partition(nn,gids,pos,vel,flags,voll,owner,nr,rgid,rpos,rvel,rflag,rvol)
-         call ls%set_nodes(nr,rgid,rpos,rvel,rflag,rvol)
          
-         call ls%detect_families()
-         ! call ls%update_VF()
 
          ! COMMS TEST
          allocate(ls%which_rank(ls%nown))
          ls%which_rank = ls%cfg%rank
+
+         call ls%update_fluid_sync()
          
       end block initialize_lss
-
-
 
      ! Create partmesh object for visualizing Lagrangian particles
       create_pmesh: block
@@ -204,29 +303,20 @@ module simulation
          pmesh%varname(1)='damage'
          pmesh%varname(2)='flag'
          pmesh%varname(3)='which_rank'
-         ! pmesh%varname(3)='nbond' ! IVM, seems like we don't currently track this?
-         ! mesh%varname(4)='von-Mises'
- 
-
+        
          pmesh%vecname(1)='velocity'
-         ! pmesh%vecname(2)='bond_force'
          pmesh%vecname(2)='fluid_force'
          pmesh%vecname(3) = 'displacement'
          call ls%update_partmesh(pmesh)
          
-         do i=1,ls%nown ! IVM, probably not the right thing 
-            
+         do i=1,ls%nown 
             pmesh%vec(:,1,i)=ls%v(:,i)
             pmesh%vec(:,2,i)=ls%ff(:,i)
             pmesh%vec(:,3,i)=ls%y(:,i)-ls%x0(:,i)
             pmesh%var(2,i)=ls%flag(i)
             pmesh%var(3,i)=ls%which_rank(i)
-            
-
          end do
       end block create_pmesh
-
-
 
       ! Create a flow solver with inflow-outflow
       create_flow_solver: block
@@ -255,21 +345,38 @@ module simulation
          use incomp_class, only: bcond
          type(bcond), pointer :: mybc
          integer :: n,i,j,k
-         real(WP) :: Uin
+         real(WP) :: Uin, Ly
          ! Read inflow velocity
          call param_read('Inlet velocity',Uin)
+         call param_read('Ly',Ly)
          ! IB arrays
          Uib=0.0_WP; Vib=0.0_WP; Wib=0.0_WP; srcM=0.0_WP
          ! Make initial velocity field random to trigger transition
-         do k=fs%cfg%kmin_,fs%cfg%kmax_
-            do j=fs%cfg%jmin_,fs%cfg%jmax_
-               do i=fs%cfg%imin_,fs%cfg%imax_
-                  fs%U(i,j,k)=0.0_WP
-                  fs%V(i,j,k)=0.0_WP
-                  fs%W(i,j,k)=0.0_WP
-              end do
-           end do
-        end do
+         if (restarted) then
+            restart_fluid: block
+            real(WP) :: step_real
+            call df%pullval(name='step', val=step_real)
+            call df%pullval(name='ls_dt', val=ls_dt)
+
+            time%n = nint(step_real)
+            time%told = time%t - time%dt
+
+            call df%pullvar(name='U', var=fs%U)
+            call df%pullvar(name='V', var=fs%V)
+            call df%pullvar(name='W', var=fs%W)
+            call df%pullvar(name='P', var=fs%P)
+            end block restart_fluid
+         else
+            do k=fs%cfg%kmin_,fs%cfg%kmax_
+                  do j=fs%cfg%jmin_,fs%cfg%jmax_
+                     do i=fs%cfg%imin_,fs%cfg%imax_
+                        fs%U(i,j,k)=0.0_WP
+                        fs%V(i,j,k)=0.0_WP
+                        fs%W(i,j,k)=0.0_WP
+                  end do
+               end do
+            end do
+         end if
          call fs%cfg%sync(fs%U)
          call fs%cfg%sync(fs%V)
          call fs%cfg%sync(fs%W)
@@ -277,7 +384,7 @@ module simulation
          call fs%get_bcond('inflow',mybc)
          do n=1,mybc%itr%no_
             i=mybc%itr%map(1,n); j=mybc%itr%map(2,n); k=mybc%itr%map(3,n)
-            fs%U(i,j,k)=Uin
+            fs%U(i,j,k)=6.0_WP * Uin * cfg%ym(j)*(Ly -cfg%ym(j))/Ly**2 
          end do
          ! Compute MFR through all boundary conditions
          call fs%get_mfr()
@@ -290,7 +397,6 @@ module simulation
          call fs%get_div(src=resU)  !< a volume source term to div
          
       end block initialize_velocity
-
 
       ! Add Ensight output
       create_ensight: block
@@ -310,8 +416,6 @@ module simulation
          ! Output to ensight
          if (ens_evt%occurs()) call ens_out%write_data(time%t)
       end block create_ensight
-
-      
       
       ! Create monitor files
       create_monitor: block
@@ -328,11 +432,13 @@ module simulation
         call mfile%add_column(fs%Umax,'Umax')
         call mfile%add_column(fs%Vmax,'Vmax')
         call mfile%add_column(fs%Wmax,'Wmax')
-         call mfile%add_column(fs%Pmax,'Pmax')
-         call mfile%add_column(fs%divmax,'Maximum divergence')
-         call mfile%add_column(fs%psolv%it,'Pressure iteration')
-         call mfile%add_column(fs%psolv%rerr,'Pressure error')
+        call mfile%add_column(fs%Pmax,'Pmax')
+        call mfile%add_column(fs%divmax,'Maximum divergence')
+        call mfile%add_column(fs%psolv%it,'Pressure iteration')
+        call mfile%add_column(fs%psolv%rerr,'Pressure error')
+        call mfile%add_column(solid_substeps,'Particle Sub-Stpes')
         call mfile%write()
+
         ! Create CFL monitor
         cflfile=monitor(fs%cfg%amRoot,'cfl')
         call cflfile%add_column(time%n,'Timestep number')
@@ -346,42 +452,42 @@ module simulation
         call cflfile%write()
 
         ! Create solid monitor
+        call ls%get_info()
         sfile=monitor(fs%cfg%amRoot,'solid')
         call sfile%add_column(time%n,'Timestep number')
         call sfile%add_column(time%t,'Time')
         call sfile%add_column(ls_dt,'Particle dt')
-        call sfile%add_column(time%cfl,'Maximum CFL')
-      !   call sfile%add_column(ls%np,'Particle number')
-        call sfile%add_column(ls%VFmax,'VFmax')
+        call sfile%add_column(ls%CFLe,'CFLe')
+        call sfile%add_column(ls%CFLp,'CFLp')
+        ! call sfile%add_column(ls%VFmax,'VFmax')
         call sfile%add_column(ls%Umin,'Particle Umin')
         call sfile%add_column(ls%Umax,'Particle Umax')
         call sfile%add_column(ls%Vmin,'Particle Vmin')
         call sfile%add_column(ls%Vmax,'Particle Vmax')
         call sfile%add_column(ls%Wmin,'Particle Wmin')
-        call sfile%add_column(ls%Wmax,'Particle Wmax')
-       
-        call sfile%add_column(ls%ibmForce(1),'Particle Fx')
-        call sfile%add_column(ls%ibmForce(2),'Particle Fy')
-        call sfile%add_column(ls%ibmForce(3),'Particle Fz')
+        call sfile%add_column(ls%Wmax,'Particle Wmax')       
+      !   call sfile%add_column(ls%ibmForce(1),'Particle Fx')
+      !   call sfile%add_column(ls%ibmForce(2),'Particle Fy')
+      !   call sfile%add_column(ls%ibmForce(3),'Particle Fz')
         call sfile%write()
 
-        call ls%get_info()
-        mfile=monitor(amRoot=amRoot,name='simulation')
-        call mfile%add_column(time%n,'Timestep')
-        call mfile%add_column(time%t,'Time')
-        call mfile%add_column(ls%np,'Nodes')
-        call mfile%add_column(ls%nb,'Bonds')
-        call mfile%add_column(ls%wtmax_kick,   'kick_max')
-        call mfile%add_column(ls%wtmax_halo,   'halo_max')
-        call mfile%add_column(ls%wtmax_dil,    'dil_max')
-        call mfile%add_column(ls%wtmin_dil,    'dil_min')
-        call mfile%add_column(ls%wtmax_force,  'force_max')
-        call mfile%add_column(ls%wtmin_force,  'force_min')
-        call mfile%add_column(ls%wtmax_reduce, 'reduce_max')
-        call mfile%add_column(ls%wtmax_contact,'contact_max')
-        call mfile%add_column(ls%wtmax_broad,  'broad_max')
-        call mfile%add_column(ls%maxtot_time,  'total_max')
-        call mfile%write()
+        ! Create solid timing monitor
+        tfile=monitor(amRoot=amRoot,name='timing')
+        call tfile%add_column(time%n,'Timestep')
+        call tfile%add_column(time%t,'Time')
+        call tfile%add_column(ls%np,'Nodes')
+        call tfile%add_column(ls%nb,'Bonds')
+        call tfile%add_column(ls%wtmax_kick,   'kick_max')
+        call tfile%add_column(ls%wtmax_halo,   'halo_max')
+        call tfile%add_column(ls%wtmax_dil,    'dil_max')
+        call tfile%add_column(ls%wtmin_dil,    'dil_min')
+        call tfile%add_column(ls%wtmax_force,  'force_max')
+        call tfile%add_column(ls%wtmin_force,  'force_min')
+        call tfile%add_column(ls%wtmax_reduce, 'reduce_max')
+        call tfile%add_column(ls%wtmax_contact,'contact_max')
+        call tfile%add_column(ls%wtmax_broad,  'broad_max')
+        call tfile%add_column(ls%maxtot_time,  'total_max')
+        call tfile%write()
       end block create_monitor
 
       print *, '================== simulation_init COMPLETE =================='
@@ -392,46 +498,52 @@ module simulation
    !> Perform an NGA2 simulation - this mimicks NGA's old time integration for multiphase
     subroutine simulation_run
       implicit none
-      real(WP) :: cfl
-      logical :: freeze_particles
+      real(WP) :: solid_cfl
 
-      freeze_particles = .false.
+      ! ls%damping_rate = 0.00025
+      ! print*, "Restart Value check:"
+      ! print*,'Material density: ',ls%rho
+      ! print*,'Elastic modulus: ', ls%elastic_modulus 
+      ! print*,'Poisson ratio: ',   ls%poisson_ratio
+      ! print*,'Particle timestep size: ',ls_dt_max
+      ! print*,'Particle Volume: ', ls%dV
 
       ! Perform time integration
       do while (.not.time%done())
          ! Increment time
-         call ls%get_cfl(time%dt,time%cfl)
-         ! call fs%get_cfl(time%dt,cfl); 
-         time%cfl=max(time%cfl,cfl)
+         call fs%get_cfl(time%dt,time%cfl)
          call time%adjust_dt()
          call time%increment()
+         solid_substeps=0
       
-         ! Advance solid solver
-         solid: block
-           real(WP) :: dt_done,mydt
-           ! Compute divergence of fluid stress
+         if (.not.steady_state) then
+            ! Advance solid solver
+            solid: block
+            real(WP) :: dt_done,mydt
+            ! Compute divergence of fluid stress (old way, currently not used)
             call fs%get_div_stress(divx=div_x(:,:,:),divy=div_y(:,:,:),divz=div_z(:,:,:))
-           ! Sub-iteratore
-           call ls%get_cfl(ls_dt,cfl=cfl)
-           if (cfl.gt.0.0_WP) ls_dt=min(ls_dt*time%cflmax/cfl,ls_dt_max)
-           dt_done=0.0_WP
-           do while (dt_done.lt.time%dtmid)
-              ! Decide the timestep size
-            
-              mydt=min(ls_dt,time%dtmid-dt_done)
-              ! Advance particles
-              if (time%t.gt.ls%unfreeze_time) freeze_particles=.true.
-              call ls%advance(dt      =mydt, & 
-              &               unfreeze = freeze_particles,            &
-              &               div_stress_x=div_x(:,:,:),&
-              &               div_stress_y=div_y(:,:,:),&
-              &               div_stress_z=div_z(:,:,:))
-              ! Increment
-             
-              dt_done=dt_done+mydt
-           end do
-           
-         end block solid
+            ! Sub-iteratore
+            call ls%get_cfl(ls_dt,cfl=solid_cfl)
+            if (solid_cfl.gt.0.0_WP) ls_dt=min(ls_dt*time%cflmax/solid_cfl,ls_dt_max)
+            dt_done=0.0_WP
+            call ls%fluid_sync(d_stress_x=div_x(:,:,:),d_stress_y=div_y(:,:,:),d_stress_z=div_z(:,:,:)) 
+            do while (dt_done.lt.time%dtmid)
+               ! Decide the timestep size
+               mydt=min(ls_dt,time%dtmid-dt_done)
+               ! Advance particles
+               call ls%advance(dt      =mydt,& 
+               &               fluid_dt=time%dtmid,&
+               &               fluid_rho=fs%rho) !,&
+               !   &               div_stress_x=fs%U(:,:,:),&
+               !   &               div_stress_y=fs%V(:,:,:),&
+               !   &               div_stress_z=fs%W(:,:,:))
+               ! Increment
+               dt_done=dt_done+mydt
+               if(cfg%amRoot) solid_substeps=solid_substeps+1
+            end do
+            call ls%update_fluid_sync()
+            end block solid
+         end if
 
          ! Evaluate IB velocity and mass source
          calc_ib_velocity: block
@@ -462,7 +574,6 @@ module simulation
             end do
             call cfg%sync(srcM)
          end block calc_ib_velocity
-
          
          ! Remember old velocity
          fs%Uold=fs%U
@@ -500,6 +611,10 @@ module simulation
                   fs%U(i,j,k)=(1.0_WP-sum(fs%itpr_x(:,i,j,k)*ls%VF(i-1:i,j,k)))*fs%U(i,j,k)+0.5_WP*(ls%VFU(i-1,j,k)+ls%VFU(i,j,k))
                   fs%V(i,j,k)=(1.0_WP-sum(fs%itpr_y(:,i,j,k)*ls%VF(i,j-1:j,k)))*fs%V(i,j,k)+0.5_WP*(ls%VFV(i,j-1,k)+ls%VFV(i,j,k))
                   fs%W(i,j,k)=(1.0_WP-sum(fs%itpr_z(:,i,j,k)*ls%VF(i,j,k-1:k)))*fs%W(i,j,k)+0.5_WP*(ls%VFW(i,j,k-1)+ls%VFW(i,j,k))
+                  ! Enforcing no slip on the walls
+                  fs%U(i,j,k)=sum(fs%itpr_x(:,i,j,k)*cfg%VF(i-1:i,j,k))*fs%U(i,j,k)
+                  fs%V(i,j,k)=sum(fs%itpr_y(:,i,j,k)*cfg%VF(i,j-1:j,k))*fs%V(i,j,k)
+                  fs%W(i,j,k)=sum(fs%itpr_z(:,i,j,k)*cfg%VF(i,j,k-1:k))*fs%W(i,j,k)
                end do; end do; end do
                call fs%cfg%sync(fs%U)
                call fs%cfg%sync(fs%V)
@@ -550,15 +665,40 @@ module simulation
                end do
             end block update_pmesh
             call ens_out%write_data(time%t)
+
+            
+         end if
+
+         if (save_evt%occurs()) then
+            save_restart: block
+               character(len=str_medium) :: checkpoint_dir
+               character(len=10) :: step_string
+               ! Prefix for files
+               write(step_string,'(i10.10)') time%n
+               checkpoint_dir = 'restart/state_'//step_string
+               call ls%write_state(dirname=trim(checkpoint_dir))
+               ! Populate df and write it
+               call df%pushval(name='t',     val=time%t)
+               call df%pushval(name='dt',    val=time%dt)
+               call df%pushval(name='step',  val=real(time%n,WP))
+               call df%pushval(name='ls_dt', val=ls_dt)
+               call df%pushvar(name='U' ,var=fs%U       )
+               call df%pushvar(name='V' ,var=fs%V       )
+               call df%pushvar(name='W' ,var=fs%W       )
+               call df%pushvar(name='P' ,var=fs%P       )
+               call df%write(fdata=trim(checkpoint_dir)//'/fluid')
+               ! Write particle file
+               
+            end block save_restart
          end if
 
          ! ! Perform and output monitoring
          call ls%get_info()
          call fs%get_max()
-         ! call ls%get_max() ! IVM, i need a replacement for this guy
          call mfile%write()
          call cflfile%write()
          call sfile%write()
+         call tfile%write()
          
       end do
 

@@ -764,12 +764,14 @@ contains
    !> Velocity-Verlet step: half-kick + drift, halo position update,
    !> dilatation gather, node-centered force sweep, halo force reduce,
    !> contact, second half-kick.
-   subroutine pd_advance(this,dt)
+   subroutine pd_advance(this,dt,dt_f,rho_f)
       use parallel, only: parallel_time
       use mathtools, only: Pi
       implicit none
       class(pdsolver), intent(inout) :: this
       real(WP), intent(in) :: dt
+      real(WP), intent(in) :: dt_f
+      real(WP), intent(in) :: rho_f
       real(WP) :: rho_inv,fdim,cvol,cdev,t0
       real(WP) :: zeta,dY,e_b,t,w
       real(WP) :: psi_fac,decay,e_d,td,beta,e_e,over
@@ -801,7 +803,7 @@ contains
       t0=parallel_time()
       do i=1,this%nown
          if (this%flag(i).eq.PDC_IS_DEAD) cycle
-         acc=this%gravity+(this%f(:,i)+this%ff(:,i))*rho_inv
+         acc=this%gravity+(this%f(:,i)+this%ff(:,i))*rho_inv! +this%ff(:,i)*rho_f/dt_f*rho_inv
          if (iand(this%flag(i),PDC_INTEGRATES).ne.0) this%v(:,i)=(1.0_WP-this%damping_rate)*this%v(:,i)+0.5_WP*dt*acc
          if (this%collapsed(1)) this%v(1,i)=0.0_WP
          if (this%collapsed(2)) this%v(2,i)=0.0_WP
@@ -1021,7 +1023,7 @@ contains
       do i=1,this%nown
          if (this%flag(i).eq.PDC_IS_DEAD) cycle
          if (iand(this%flag(i),PDC_INTEGRATES).ne.0) then
-            acc=this%gravity+(this%f(:,i)+this%ff(:,i))*rho_inv
+            acc=this%gravity+(this%f(:,i)+this%ff(:,i))*rho_inv! +this%ff(:,i)*rho_f/dt_f*rho_inv
             this%v(:,i)=(1.0_WP-this%damping_rate)*this%v(:,i)+0.5_WP*dt*acc
          end if
          if (this%collapsed(1)) this%v(1,i)=0.0_WP

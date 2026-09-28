@@ -2,34 +2,38 @@
 Partition :	8 1 1
 
 # Mesh definition
-R : 0.5
+R : 0.05
 N_r : 20
-X- ratio : 4
-X+ ratio : 10
-Y ratio : 4
-Z ratio : 0
-# Case definition
+Lx : 2.5
+Ly : 0.41
+Lz : 0.0
 
-Bar length : 0.35
-Bar width : 0.02
+# Case definition
+a : 0.35
+b : 0.02
+x_c : 0.2
+y_c : 0.2
 Inlet velocity :  1.0
 
 # Solid properties
 # Solid Spacing = 0.00165
-Elastic modulus : 1e9
-# Poisson Ratio : 0.4
-Material density : 1
+Elastic modulus : 1.46e6
+Poisson Ratio : 0.4
+Material density : 10000
 Critical Energy Release Rate : 1000000
 # Solid Damping Constant : 0.05
 # Tau : 5.0e-4 
+Particle timestep size : 4e-5
+Steady state : .false.
+
 # Fluid properties
-Dynamic viscosity : 0.001
-Density :           1
+Dynamic viscosity : 1
+Density :           1000
 
 # Time integration
-Max timestep size : 5e-7
-Max cfl number :    0.9
-Max time :          100
+Max timestep size : 4e-4
+Max cfl number :    0.85
+Max time :          10
 # Unfreeze time: 5.0e-3
 
 # Pressure solver
@@ -37,4 +41,8 @@ Pressure tolerance : 1e-8
 Pressure iteration : 100
 
 # Ensight output
-Ensight output period : 1e-6
+Ensight output period : 1e-2
+
+# Restart output
+# Restart output period : 1.0
+Restart from : restart/state_0000003412

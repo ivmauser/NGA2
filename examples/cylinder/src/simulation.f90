@@ -267,19 +267,19 @@ contains
          fs%Vold=fs%V
          fs%Wold=fs%W
          
-         ! IB slip velocity modeling for high Re flows
-         !sgs_modeling: block
-         !   real(WP), parameter :: Cwm=1.0_WP ! Whitmore, Bose, and Moin, as well as Hausmann and van Wachem
-         !   integer :: i,j,k
-         !   ! Get velocity gradient tensor
-         !   call fs%get_gradu(gradU)
-         !   ! Compute slip velocity using Cslip*delta*du/dn
-         !   do k=fs%cfg%kmino_,fs%cfg%kmaxo_; do j=fs%cfg%jmino_,fs%cfg%jmaxo_; do i=fs%cfg%imino_,fs%cfg%imaxo_
-         !      Uib(i,j,k)=-Cwm*fs%cfg%meshsize(i,j,k)*sum(gradU(:,1,i,j,k)*cfg%Nib(:,i,j,k))
-         !      Vib(i,j,k)=-Cwm*fs%cfg%meshsize(i,j,k)*sum(gradU(:,2,i,j,k)*cfg%Nib(:,i,j,k))
-         !      Wib(i,j,k)=-Cwm*fs%cfg%meshsize(i,j,k)*sum(gradU(:,3,i,j,k)*cfg%Nib(:,i,j,k))
-         !   end do; end do; end do
-         !end block sgs_modeling
+         IB slip velocity modeling for high Re flows
+         sgs_modeling: block
+           real(WP), parameter :: Cwm=1.0_WP ! Whitmore, Bose, and Moin, as well as Hausmann and van Wachem
+           integer :: i,j,k
+           ! Get velocity gradient tensor
+           call fs%get_gradu(gradU)
+           ! Compute slip velocity using Cslip*delta*du/dn
+           do k=fs%cfg%kmino_,fs%cfg%kmaxo_; do j=fs%cfg%jmino_,fs%cfg%jmaxo_; do i=fs%cfg%imino_,fs%cfg%imaxo_
+              Uib(i,j,k)=-Cwm*fs%cfg%meshsize(i,j,k)*sum(gradU(:,1,i,j,k)*cfg%Nib(:,i,j,k))
+              Vib(i,j,k)=-Cwm*fs%cfg%meshsize(i,j,k)*sum(gradU(:,2,i,j,k)*cfg%Nib(:,i,j,k))
+              Wib(i,j,k)=-Cwm*fs%cfg%meshsize(i,j,k)*sum(gradU(:,3,i,j,k)*cfg%Nib(:,i,j,k))
+           end do; end do; end do
+         end block sgs_modeling
          
          ! Perform sub-iterations
          do while (time%it.le.time%itmax)

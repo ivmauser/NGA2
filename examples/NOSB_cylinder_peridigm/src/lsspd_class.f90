@@ -6,13 +6,14 @@ module lsspd_class
    use config_class,   only: config
    use ddadi_class,    only: ddadi
    use mpi_f08,        only: MPI_Datatype,MPI_INTEGER8,MPI_INTEGER,MPI_DOUBLE_PRECISION
-   use NOSB_class,     only: pdsolver, PDC_IS_DEAD, PDC_BONDS, PDC_INTEGRATES, PDC_MOVES, pd_partition
+   use OSB_class,      only: pdsolver, PDC_IS_DEAD, PDC_BONDS, PDC_INTEGRATES, PDC_MOVES, pd_partition, PDC_SURFACE
+
    implicit none
    private
    
    
    ! Expose type/constructor/methods
-   public :: lss, PDC_MOVES, PDC_IS_DEAD, PDC_BONDS, PDC_INTEGRATES, pd_partition
+   public :: lss, PDC_MOVES, PDC_IS_DEAD, PDC_BONDS, PDC_INTEGRATES, pd_partition, PDC_SURFACE
    
    
    !> Memory adaptation parameter
@@ -60,8 +61,8 @@ module lsspd_class
        ! CFL numbers
       real(WP) :: CFLp_x,CFLp_y,CFLp_z,CFLp_a
       
-      real(WP) :: VFmax                              !< Volume fraction info
-      real(WP), dimension(3) :: ibmForce             !< Total force due to IBM
+      ! real(WP) :: VFmax                              !< Volume fraction info
+      ! real(WP), dimension(3) :: ibmForce             !< Total force due to IBM
 
       ! Filtering operation
       real(WP) :: filter_width                       !< Characteristic filter width
@@ -74,7 +75,7 @@ module lsspd_class
                                                       !<  but not in the pdsolver alone I think)
 
       ! Moving or not (allow flow to setup)
-      real(WP) :: unfreeze_time
+      ! real(WP) :: unfreeze_time
 
       ! Communcation related fields for handling the fluid solver
       integer, allocatable :: fluid_rank(:)           !< Fluid rank associated with the particle
@@ -90,6 +91,7 @@ module lsspd_class
       procedure :: update_fluid_location             !< Update the fluid rank and index for each particle
       procedure :: fluid_sync
       procedure :: compute_fluid_forces
+      procedure :: update_fluid_sync
    end type lss
 
    
@@ -246,46 +248,20 @@ contains
    
 
    !> Advance the particle equations by a specified time step dt
-   subroutine advance(this,dt,unfreeze,div_stress_x,div_stress_y,div_stress_z)
+   subroutine advance(this,dt,fluid_dt,fluid_rho)! ,div_stress_x,div_stress_y,div_stress_z)
       implicit none
       class(lss), intent(inout) :: this
-      real(WP), intent(inout) :: dt  !< Timestep size over which to advance
-      real(WP), dimension(this%cfg%imino_:,this%cfg%jmino_:,this%cfg%kmino_:), intent(inout) :: div_stress_x  !< Needs to be (imino_:imaxo_,jmino_:jmaxo_,kmino_:kmaxo_)
-      real(WP), dimension(this%cfg%imino_:,this%cfg%jmino_:,this%cfg%kmino_:), intent(inout) :: div_stress_y  !< Needs to be (imino_:imaxo_,jmino_:jmaxo_,kmino_:kmaxo_)
-      real(WP), dimension(this%cfg%imino_:,this%cfg%jmino_:,this%cfg%kmino_:), intent(inout) :: div_stress_z  !< Needs to be (imino_:imaxo_,jmino_:jmaxo_,kmino_:kmaxo_)
+      real(WP), intent(inout) :: dt,fluid_dt,fluid_rho  !< Timestep size over which to advance
+      ! real(WP), dimension(this%cfg%imino_:,this%cfg%jmino_:,this%cfg%kmino_:), intent(inout) :: div_stress_x  !< Needs to be (imino_:imaxo_,jmino_:jmaxo_,kmino_:kmaxo_)
+      ! real(WP), dimension(this%cfg%imino_:,this%cfg%jmino_:,this%cfg%kmino_:), intent(inout) :: div_stress_y  !< Needs to be (imino_:imaxo_,jmino_:jmaxo_,kmino_:kmaxo_)
+      ! real(WP), dimension(this%cfg%imino_:,this%cfg%jmino_:,this%cfg%kmino_:), intent(inout) :: div_stress_z  !< Needs to be (imino_:imaxo_,jmino_:jmaxo_,kmino_:kmaxo_)
       integer :: n,i
-      logical, intent(in) :: unfreeze
+      ! logical, intent(in) :: unfreeze
       ! updates particle positions, shares particles to fluid-cell rank-owners, compute fluid force, and return ff (fluid force) 
-      call this%fluid_sync(d_stress_x=div_stress_x,d_stress_y=div_stress_y,d_stress_z=div_stress_z) 
+      ! call this%fluid_sync(d_stress_x=div_stress_x,d_stress_y=div_stress_y,d_stress_z=div_stress_z) 
       ! now the particles are communicated down to get their fluid forces
-      call this%pd_advance(dt) ! use fluid forces and compute bond forces, and update position due to verlet scheme
-      call this%update_VF()
-      if (unfreeze) then
-         do i = 1,this%nown
-            this%damping_rate = 0.0005_WP
-            if (this%flag(i).eq.(PDC_MOVES+PDC_BONDS)) this%v(:,i)= 0.0_WP
-         end do
-      end if
-
-
-      
-      ! call this%update_VF() ! now we update the volume fraction
-
-      
-      ! Log/screen output (do we need to do this still?)
-      ! logging: block
-      !    use, intrinsic :: iso_fortran_env, only: output_unit
-      !    use param,    only: verbose
-      !    use messager, only: log
-      !    use string,   only: str_long
-      !    character(len=str_long) :: message
-      !    if (this%cfg%amRoot) then
-      !       write(message,'("Particle solver [",a,"] on partitioned grid [",a,"]: ",i0," particles were advanced")') trim(this%name),trim(this%cfg%name),this%np
-      !       if (verbose.gt.1) write(output_unit,'(a)') trim(message)
-      !       if (verbose.gt.0) call log(message)
-      !    end if
-      ! end block logging
-      
+      call this%pd_advance(dt,fluid_dt,fluid_rho) ! use fluid forces and compute bond forces, and update position due to verlet scheme
+      ! call this%update_VF()
    end subroutine advance
 
 
@@ -790,7 +766,7 @@ contains
          deallocate(this%fluid_copy%ff)
       end if
       allocate(this%fluid_copy%ff(3,max(nrecv,1)))
-      this%fluid_copy%ff=0.0_WP
+      ! this%fluid_copy%ff=0.0_WP
       call this%update_VF()
       call this%compute_fluid_forces(stress_x=d_stress_x,stress_y=d_stress_y,stress_z=d_stress_z)
 
@@ -815,6 +791,113 @@ contains
 
    end subroutine fluid_sync
 
+   subroutine update_fluid_sync(this)
+      use parallel, only: MPI_REAL_WP
+      use mpi_f08
+      implicit none
+
+      class(lss), intent(inout) :: this
+      
+      integer :: i, ierr, nranks, r, nsend, nrecv, rank, column
+      integer, allocatable :: send_count(:), recv_count(:)
+      integer, allocatable :: send_disp(:), recv_disp(:)
+      integer, allocatable :: next(:)
+      real(WP), allocatable :: send_yv(:,:), recv_yv(:,:)
+      ! Maybe we do this seperatately instead of tying it in?
+      call this%update_fluid_location() ! We update the fluid location and rank information for each particle nown
+
+      nranks=this%cfg%nproc
+      allocate(send_count(0:nranks-1), recv_count(0:nranks-1))
+      send_count=0
+      recv_count=0
+      do i = 1,this%nown
+         if (this%flag(i).eq.PDC_IS_DEAD) cycle
+         send_count(this%fluid_rank(i)) = send_count(this%fluid_rank(i)) + 1 ! count up how many particles need to get passed along 
+      end do
+      ! Now we populate the recv_count array by doing an all-to-all communication (only 1)
+      call MPI_ALLTOALL(send_count,1,MPI_INTEGER, &
+                      & recv_count,1,MPI_INTEGER, &
+                      & this%cfg%comm,ierr)
+      nsend = sum(send_count) ! total number of particles that are being send 
+      nrecv = sum(recv_count) ! total number of particles we expect to recieve
+      ! Set up the displacement counts based on number of particles
+      allocate(send_disp(0:nranks-1), recv_disp(0:nranks-1))
+      send_disp(0) = 0
+      recv_disp(0) = 0
+      do rank=1,nranks-1
+         send_disp(rank) = send_disp(rank-1) + send_count(rank-1)
+         recv_disp(rank) = recv_disp(rank-1) + recv_count(rank-1)
+      end do
+      ! Pack message
+      allocate(send_yv(6,max(nsend,1)))
+      allocate(recv_yv(6,max(nrecv,1)))
+      send_yv=0.0_WP
+      recv_yv=0.0_WP
+      allocate(next(0:nranks-1))
+      next=send_disp ! cursor
+      ! pack up the send buffer
+      do i = 1,this%nown
+         if (this%flag(i).eq.PDC_IS_DEAD) cycle
+         rank = this%fluid_rank(i)
+         next(rank) = next(rank) + 1 ! plus up for each particle that we are including starting at the rank displacement +1, (this will 
+                                     ! not overwrite because the next(:) is based on the displacments and ensures the column mappings keeps
+                                     ! same-rank particles in blocks of adjacent columns)
+         column = next(rank) ! this is the index for the start of the information for that particle
+         ! The way that fortran stores information is column major so we associate each particle with a particular column
+         ! that way when we send it, it sends all in order the information for a particle, and we can unwrap
+         ! the send information in the same way if we construct the recieve buffer the same
+         send_yv(1:3,column) = this%y(:,i)
+         send_yv(4:6,column) = this%v(:,i)
+         ! save the local id for the way back
+      end do
+      !    MPI_Alltoallv(
+      !    sendbuf,        Starting address of the send buffer in memory
+      !    sendcounts,     Counts for the number of elements to send to each rank
+      !    sdispls,        Displacements for the starting address of each rank's data in the send buffer, relative to sendbuf
+      !    sendtype,       Data type of the send buffer elements
+      !    recvbuf,        Starting address of the receive buffer in memory
+      !    recvcounts[],   Counts for the number of elements to receive from each rank
+      !    rdispls[],      Displacements for the starting address of each rank's data in the receive buffer, relative to recvbuf
+      !    recvtype,       Data type of the receive buffer elements
+      !    comm            Communicator handle
+      !    )
+      ! each entry of send_counts is just 6 times the number of particles we are sending to that rank
+
+      call MPI_ALLTOALLV(send_yv,send_count*6,send_disp*6,MPI_REAL_WP, &
+                        recv_yv,recv_count*6,recv_disp*6,MPI_REAL_WP, &
+                        this%cfg%comm,ierr)
+      
+      ! now recv_yv has all the particles that this processor needed, which we need to reconstruct
+      ! clear out the existing copies
+      if (allocated(this%fluid_copy%y)) then
+         deallocate(this%fluid_copy%y)
+      end if
+
+      if (allocated(this%fluid_copy%v)) then
+         deallocate(this%fluid_copy%v)
+      end if
+      this%fluid_copy%nown=nrecv
+      allocate(this%fluid_copy%y(3,max(nrecv,1)))
+      allocate(this%fluid_copy%v(3,max(nrecv,1)))
+      this%fluid_copy%y=0.0_WP
+      this%fluid_copy%v=0.0_WP
+
+      if (nrecv.gt.0) then
+         this%fluid_copy%y(:,1:nrecv)=recv_yv(1:3,1:nrecv)
+         this%fluid_copy%v(:,1:nrecv)=recv_yv(4:6,1:nrecv)
+      end if
+
+      ! I think if we are careful about the order of nown we send and recieve, and keep it identically the same
+      ! we can get away without having to send the particle global id
+
+      call this%update_VF()
+
+      deallocate(next)
+      deallocate(send_yv,recv_yv)
+      deallocate(send_count,recv_count)
+
+   end subroutine update_fluid_sync
+
    ! Compute fluid forces acting on fluid_copy particles on each rank
    subroutine compute_fluid_forces(this,stress_x,stress_y,stress_z)
       implicit none
@@ -832,7 +915,9 @@ contains
          ! Advance with Verlet scheme
          
          idx = this%cfg%get_ijk_global(this%fluid_copy%y(:,n),idx) ! is this slow? should we store it?
-         this%fluid_copy%ff(:,n)=this%cfg%get_velocity(pos=this%fluid_copy%y(:,n),i0=idx(1),j0=idx(2),k0=idx(3),U=stress_x,V=stress_y,W=stress_z)
+         this%fluid_copy%ff(:,n)=this%cfg%get_velocity(pos=this%fluid_copy%y(:,n),i0=idx(1),j0=idx(2),k0=idx(3),U=stress_x,V=stress_y,W=stress_z)!  - this%fluid_copy%v(:,n)
+         
+
          ! we will divide by rho later
 
       end do
