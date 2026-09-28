@@ -256,6 +256,7 @@ module simulation
                pos(:,n)=[x0, y0, z0]
                vel(:,n)=[0.0_WP, 0.0_WP, 0.0_WP]
                flags(n)= PDC_BONDS ! PDC_MOVES+PDC_INTEGRATES+PDC_BONDS !< IVM, bitwise, this should keep it still?
+               if (((x0-x_c)*(x0-x_c) + (y0-y_c)*(y0-y_c)).ge.(R-ls%delta)*(R-ls%delta)) flags(n)= PDC_BONDS + PDC_SURFACE
                gids(n)=int(n,I8)
                voll(n)=elem**3
             end do; end do; end do
@@ -273,9 +274,9 @@ module simulation
                vel(:,n)=[0.0_WP, 0.0_WP, 0.0_WP]
                flags(n)= PDC_BONDS !PDC_MOVES+PDC_INTEGRATES+PDC_BONDS !< IVM, bitwise, this should keep it still?
                if ((x0-x_c).gt.R) flags(n)=PDC_MOVES+PDC_INTEGRATES+PDC_BONDS
-               if((j.eq.1).and.((x0-x_c).gt.R)) flags(n) = PDC_MOVES+PDC_INTEGRATES+PDC_BONDS+ PDC_SURFACE
-               if((j.eq.bny).and.((x0-x_c).gt.R)) flags(n) = PDC_MOVES+PDC_INTEGRATES+PDC_BONDS + PDC_SURFACE
-               if((i.eq.bnx).and.((x0-x_c).gt.R)) flags(n) = PDC_MOVES+PDC_INTEGRATES+PDC_BONDS + PDC_SURFACE
+               if((j.le.3).and.((x0-x_c).gt.(R-ls%delta))) flags(n) = PDC_MOVES+PDC_INTEGRATES+PDC_BONDS+ PDC_SURFACE
+               if((j.ge.bny-2).and.((x0-x_c).gt.(R-ls%delta))) flags(n) = PDC_MOVES+PDC_INTEGRATES+PDC_BONDS + PDC_SURFACE
+               if((i.ge.bnx-2).and.((x0-x_c).gt.R)) flags(n) = PDC_MOVES+PDC_INTEGRATES+PDC_BONDS + PDC_SURFACE
                gids(n)=int(n,I8)
                voll(n)=elem**3
             end do; end do; end do
@@ -516,64 +517,68 @@ module simulation
          call time%increment()
          solid_substeps=0
       
-         if (.not.steady_state) then
-            ! Advance solid solver
-            solid: block
+         solid: block
             real(WP) :: dt_done,mydt
-            ! Compute divergence of fluid stress (old way, currently not used)
-            call fs%get_div_stress(divx=div_x(:,:,:),divy=div_y(:,:,:),divz=div_z(:,:,:))
-            ! Sub-iteratore
-            call ls%get_cfl(ls_dt,cfl=solid_cfl)
-            if (solid_cfl.gt.0.0_WP) ls_dt=min(ls_dt*time%cflmax/solid_cfl,ls_dt_max)
-            dt_done=0.0_WP
-            call ls%fluid_sync(d_stress_x=div_x(:,:,:),d_stress_y=div_y(:,:,:),d_stress_z=div_z(:,:,:)) 
-            do while (dt_done.lt.time%dtmid)
-               ! Decide the timestep size
-               mydt=min(ls_dt,time%dtmid-dt_done)
-               ! Advance particles
-               call ls%advance(dt      =mydt,& 
-               &               fluid_dt=time%dtmid,&
-               &               fluid_rho=fs%rho) !,&
-               !   &               div_stress_x=fs%U(:,:,:),&
-               !   &               div_stress_y=fs%V(:,:,:),&
-               !   &               div_stress_z=fs%W(:,:,:))
-               ! Increment
-               dt_done=dt_done+mydt
-               if(cfg%amRoot) solid_substeps=solid_substeps+1
-            end do
-            call ls%update_fluid_sync()
-            end block solid
-         end if
-
-         ! Evaluate IB velocity and mass source
-         calc_ib_velocity: block
-            integer :: i,j,k
-            do k=fs%cfg%kmin_,fs%cfg%kmax_
-               do j=fs%cfg%jmin_,fs%cfg%jmax_
-                  do i=fs%cfg%imin_,fs%cfg%imax_
-                     ! VF based velocity
-                     Uib(i,j,k)=0.5_WP*(ls%VFU(i-1,j,k)+ls%VFU(i,j,k))/(sum(fs%itpr_x(:,i,j,k)*ls%VF(i-1:i,j,k))+epsilon(1.0_WP))
-                     Vib(i,j,k)=0.5_WP*(ls%VFV(i,j-1,k)+ls%VFV(i,j,k))/(sum(fs%itpr_y(:,i,j,k)*ls%VF(i,j-1:j,k))+epsilon(1.0_WP))
-                     Wib(i,j,k)=0.5_WP*(ls%VFW(i,j,k-1)+ls%VFW(i,j,k))/(sum(fs%itpr_z(:,i,j,k)*ls%VF(i,j,k-1:k))+epsilon(1.0_WP))
-                  end do
+            
+            if (.not.steady_state) then
+               ! Advance solid solver
+               
+               ! Compute divergence of fluid stress (old way, currently not used)
+               ! call fs%get_div_stress(divx=div_x(:,:,:),divy=div_y(:,:,:),divz=div_z(:,:,:))
+               ! Sub-iteratore
+               call ls%get_cfl(ls_dt,cfl=solid_cfl)
+               if (solid_cfl.gt.0.0_WP) ls_dt=min(ls_dt*time%cflmax/solid_cfl,ls_dt_max)
+               dt_done=0.0_WP
+               
+               do while (dt_done.lt.time%dtmid)
+                  ! Decide the timestep size
+                  mydt=min(ls_dt,time%dtmid-dt_done)
+                  ! Advance particles
+                  call ls%fluid_sync(dt_f=time%dtmid,fvel_x=fs%U,fvel_y=fs%V,fvel_z=fs%W) 
+                  call ls%advance(dt      =mydt,& 
+                  &               fluid_dt=time%dtmid,&
+                  &               fluid_rho=fs%rho) !,&
+                  !   &               div_stress_x=fs%U(:,:,:),&
+                  !   &               div_stress_y=fs%V(:,:,:),&
+                  !   &               div_stress_z=fs%W(:,:,:))
+                  ! Increment
+                  dt_done=dt_done+mydt
+                  if(cfg%amRoot) solid_substeps=solid_substeps+1
                end do
-            end do
-            call cfg%sync(Uib)
-            call cfg%sync(Vib)
-            call cfg%sync(Wib)
-            ! Compute IB mass source
-            do k=fs%cfg%kmin_,fs%cfg%kmax_
-               do j=fs%cfg%jmin_,fs%cfg%jmax_
-                  do i=fs%cfg%imin_,fs%cfg%imax_
-                     srcM(i,j,k)=fs%rho*(ls%VF(i,j,k)*(sum(fs%divp_x(:,i,j,k)*Uib(i:i+1,j,k))+&
-                     &                                sum(fs%divp_y(:,i,j,k)*Vib(i,j:j+1,k))+&
-                     &                                sum(fs%divp_z(:,i,j,k)*Wib(i,j,k:k+1))))
+               call ls%update_fluid_sync()
+               
+            end if
+         end block solid
 
-                  end do
-               end do
-            end do
-            call cfg%sync(srcM)
-         end block calc_ib_velocity
+         ! ! Evaluate IB velocity and mass source
+         ! calc_ib_velocity: block
+         !    integer :: i,j,k
+         !    do k=fs%cfg%kmin_,fs%cfg%kmax_
+         !       do j=fs%cfg%jmin_,fs%cfg%jmax_
+         !          do i=fs%cfg%imin_,fs%cfg%imax_
+         !             ! VF based velocity
+         !             Uib(i,j,k)=0.5_WP*(ls%VFU(i-1,j,k)+ls%VFU(i,j,k))/(sum(fs%itpr_x(:,i,j,k)*ls%VF(i-1:i,j,k))+epsilon(1.0_WP))
+         !             Vib(i,j,k)=0.5_WP*(ls%VFV(i,j-1,k)+ls%VFV(i,j,k))/(sum(fs%itpr_y(:,i,j,k)*ls%VF(i,j-1:j,k))+epsilon(1.0_WP))
+         !             Wib(i,j,k)=0.5_WP*(ls%VFW(i,j,k-1)+ls%VFW(i,j,k))/(sum(fs%itpr_z(:,i,j,k)*ls%VF(i,j,k-1:k))+epsilon(1.0_WP))
+         !          end do
+         !       end do
+         !    end do
+         !    call cfg%sync(Uib)
+         !    call cfg%sync(Vib)
+         !    call cfg%sync(Wib)
+         !    ! Compute IB mass source
+         !    do k=fs%cfg%kmin_,fs%cfg%kmax_
+         !       do j=fs%cfg%jmin_,fs%cfg%jmax_
+         !          do i=fs%cfg%imin_,fs%cfg%imax_
+         !             srcM(i,j,k)=fs%rho*(ls%VF(i,j,k)*(sum(fs%divp_x(:,i,j,k)*Uib(i:i+1,j,k))+&
+         !             &                                sum(fs%divp_y(:,i,j,k)*Vib(i,j:j+1,k))+&
+         !             &                                sum(fs%divp_z(:,i,j,k)*Wib(i,j,k:k+1))))
+
+         !          end do
+         !       end do
+         !    end do
+         !    call cfg%sync(srcM)
+         ! end block calc_ib_velocity
          
          ! Remember old velocity
          fs%Uold=fs%U
@@ -605,29 +610,56 @@ module simulation
             fs%W=2.0_WP*fs%W-fs%Wold+resW
             
             ! Apply direct IB forcing
-            ibforcing: block
+            ! ibforcing: block
+            !    integer :: i,j,k
+            !    do k=fs%cfg%kmin_,fs%cfg%kmax_; do j=fs%cfg%jmin_,fs%cfg%jmax_; do i=fs%cfg%imin_,fs%cfg%imax_
+            !       fs%U(i,j,k)=(1.0_WP-sum(fs%itpr_x(:,i,j,k)*ls%VF(i-1:i,j,k)))*fs%U(i,j,k)+0.5_WP*(ls%VFU(i-1,j,k)+ls%VFU(i,j,k))
+            !       fs%V(i,j,k)=(1.0_WP-sum(fs%itpr_y(:,i,j,k)*ls%VF(i,j-1:j,k)))*fs%V(i,j,k)+0.5_WP*(ls%VFV(i,j-1,k)+ls%VFV(i,j,k))
+            !       fs%W(i,j,k)=(1.0_WP-sum(fs%itpr_z(:,i,j,k)*ls%VF(i,j,k-1:k)))*fs%W(i,j,k)+0.5_WP*(ls%VFW(i,j,k-1)+ls%VFW(i,j,k))
+            !       ! Enforcing no slip on the walls
+            !       fs%U(i,j,k)=sum(fs%itpr_x(:,i,j,k)*cfg%VF(i-1:i,j,k))*fs%U(i,j,k)
+            !       fs%V(i,j,k)=sum(fs%itpr_y(:,i,j,k)*cfg%VF(i,j-1:j,k))*fs%V(i,j,k)
+            !       fs%W(i,j,k)=sum(fs%itpr_z(:,i,j,k)*cfg%VF(i,j,k-1:k))*fs%W(i,j,k)
+            !    end do; end do; end do
+            !    call fs%cfg%sync(fs%U)
+            !    call fs%cfg%sync(fs%V)
+            !    call fs%cfg%sync(fs%W)
+            ! end block ibforcing
+            ibm_correction: block
                integer :: i,j,k
-               do k=fs%cfg%kmin_,fs%cfg%kmax_; do j=fs%cfg%jmin_,fs%cfg%jmax_; do i=fs%cfg%imin_,fs%cfg%imax_
-                  fs%U(i,j,k)=(1.0_WP-sum(fs%itpr_x(:,i,j,k)*ls%VF(i-1:i,j,k)))*fs%U(i,j,k)+0.5_WP*(ls%VFU(i-1,j,k)+ls%VFU(i,j,k))
-                  fs%V(i,j,k)=(1.0_WP-sum(fs%itpr_y(:,i,j,k)*ls%VF(i,j-1:j,k)))*fs%V(i,j,k)+0.5_WP*(ls%VFV(i,j-1,k)+ls%VFV(i,j,k))
-                  fs%W(i,j,k)=(1.0_WP-sum(fs%itpr_z(:,i,j,k)*ls%VF(i,j,k-1:k)))*fs%W(i,j,k)+0.5_WP*(ls%VFW(i,j,k-1)+ls%VFW(i,j,k))
-                  ! Enforcing no slip on the walls
-                  fs%U(i,j,k)=sum(fs%itpr_x(:,i,j,k)*cfg%VF(i-1:i,j,k))*fs%U(i,j,k)
-                  fs%V(i,j,k)=sum(fs%itpr_y(:,i,j,k)*cfg%VF(i,j-1:j,k))*fs%V(i,j,k)
-                  fs%W(i,j,k)=sum(fs%itpr_z(:,i,j,k)*cfg%VF(i,j,k-1:k))*fs%W(i,j,k)
-               end do; end do; end do
-               call fs%cfg%sync(fs%U)
-               call fs%cfg%sync(fs%V)
-               call fs%cfg%sync(fs%W)
-            end block ibforcing
+               ! Interpolate to the staggered cells and synchronize
+               resU=0.0_WP; resV=0.0_WP; resW=0.0_WP
+               call ls%fluid_sync(dt_f=time%dtmid,fvel_x=fs%U,fvel_y=fs%V,fvel_z=fs%W) 
+               do k=fs%cfg%kmin_,fs%cfg%kmax_
+                  do j=fs%cfg%jmin_,fs%cfg%jmax_
+                     do i=fs%cfg%imin_,fs%cfg%imax_
+                        resU(i,j,k)=sum(fs%itpr_x(:,i,j,k)*ls%srcU(i-1:i,j,k))
+                        resV(i,j,k)=sum(fs%itpr_y(:,i,j,k)*ls%srcV(i,j-1:j,k))
+                        resW(i,j,k)=sum(fs%itpr_z(:,i,j,k)*ls%srcW(i,j,k-1:k))
+                        fs%U(i,j,k)=sum(fs%itpr_x(:,i,j,k)*cfg%VF(i-1:i,j,k))*fs%U(i,j,k)
+                        fs%V(i,j,k)=sum(fs%itpr_y(:,i,j,k)*cfg%VF(i,j-1:j,k))*fs%V(i,j,k)
+                        fs%W(i,j,k)=sum(fs%itpr_z(:,i,j,k)*cfg%VF(i,j,k-1:k))*fs%W(i,j,k)
+                     end do
+                  end do
+               end do
+               call fs%cfg%sync(resU)
+               call fs%cfg%sync(resV)
+               call fs%cfg%sync(resW)
+               ! Increment velocity field
+               fs%U=fs%U+resU
+               fs%V=fs%V+resV
+               fs%W=fs%W+resW
+            end block ibm_correction
             
             ! Apply other boundary conditions
             call fs%apply_bcond(time%t,time%dtmid)
 
             ! Solve Poisson equation
-            call fs%correct_mfr(src=srcM)
-            resU=srcM/fs%rho           !< Careful, we need to provide
-            call fs%get_div(src=resU)  !< a volume source term to div
+            ! call fs%correct_mfr(src=srcM)
+            call fs%correct_mfr()
+            ! resU=srcM/fs%rho           !< Careful, we need to provide
+            ! call fs%get_div(src=resU)  !< a volume source term to div
+            call fs%get_div()
             fs%psolv%rhs=-fs%cfg%vol*fs%div*fs%rho/time%dtmid
             fs%psolv%sol=0.0_WP
             call fs%psolv%solve()
@@ -647,8 +679,9 @@ module simulation
          
          ! Recompute interpolated velocity and divergence
          call fs%interp_vel(Ui,Vi,Wi)
-         resU=srcM/fs%rho           !< Careful, we need to provide
-         call fs%get_div(src=resU)  !< a volume source term to div
+         ! resU=srcM/fs%rho           !< Careful, we need to provide
+         ! call fs%get_div(src=resU)  !< a volume source term to div
+         call fs%get_div()
 
          ! Output to ensight
          if (ens_evt%occurs()) then

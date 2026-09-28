@@ -783,8 +783,8 @@ contains
       t0=parallel_time()
       do i=1,this%nown
          if (this%flag(i).eq.PDC_IS_DEAD) cycle
-         if (iand(this%flag(i),PDC_SURFACE).eq.0) this%ff(:,i) = 0.0_WP
-         acc=this%gravity+(this%f(:,i)+this%ff(:,i))*rho_inv ! + this%ff(:,i)*rho_f/dt_f*rho_inv
+         ! if (iand(this%flag(i),PDC_SURFACE).eq.0) this%ff(:,i) = 0.0_WP
+         acc=this%gravity+this%f(:,i)*rho_inv + this%ff(:,i)*rho_f*rho_inv
          if (iand(this%flag(i),PDC_INTEGRATES).ne.0) this%v(:,i)=(1.0_WP-this%damping_rate)*this%v(:,i)+0.5_WP*dt*acc
          if (this%collapsed(1)) this%v(1,i)=0.0_WP
          if (this%collapsed(2)) this%v(2,i)=0.0_WP
@@ -988,7 +988,7 @@ contains
       do i=1,this%nown
          if (this%flag(i).eq.PDC_IS_DEAD) cycle
          if (iand(this%flag(i),PDC_INTEGRATES).ne.0) then
-            acc=this%gravity+(this%f(:,i)+ this%ff(:,i))*rho_inv ! + this%ff(:,i)*rho_f/dt_f*rho_inv
+            acc=this%gravity+this%f(:,i)*rho_inv + this%ff(:,i)*rho_f*rho_inv
             this%v(:,i)=(1.0_WP-this%damping_rate)*this%v(:,i)+0.5_WP*dt*acc
          end if
          if (this%collapsed(1)) this%v(1,i)=0.0_WP
