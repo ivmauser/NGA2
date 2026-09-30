@@ -276,7 +276,7 @@ module simulation
                if ((x0-x_c).gt.R) flags(n)=PDC_MOVES+PDC_INTEGRATES+PDC_BONDS
                if((j.le.3).and.((x0-x_c).gt.(R-ls%delta))) flags(n) = PDC_MOVES+PDC_INTEGRATES+PDC_BONDS+ PDC_SURFACE
                if((j.ge.bny-2).and.((x0-x_c).gt.(R-ls%delta))) flags(n) = PDC_MOVES+PDC_INTEGRATES+PDC_BONDS + PDC_SURFACE
-               if((i.ge.bnx-2).and.((x0-x_c).gt.R)) flags(n) = PDC_MOVES+PDC_INTEGRATES+PDC_BONDS + PDC_SURFACE
+               if((i.ge.bnx-2).and.((x0-x_c).gt.R-ls%delta)) flags(n) = PDC_MOVES+PDC_INTEGRATES+PDC_BONDS + PDC_SURFACE
                gids(n)=int(n,I8)
                voll(n)=elem**3
             end do; end do; end do
