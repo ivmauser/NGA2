@@ -256,6 +256,7 @@ module simulation
                pos(:,n)=[x0, y0, z0]
                vel(:,n)=[0.0_WP, 0.0_WP, 0.0_WP]
                flags(n)= PDC_BONDS ! PDC_MOVES+PDC_INTEGRATES+PDC_BONDS !< IVM, bitwise, this should keep it still?
+               if (((x0-x_c)*(x0-x_c) + (y0-y_c)*(y0-y_c)).ge.(R-ls%delta)*(R-ls%delta)) flags(n)= PDC_BONDS + PDC_SURFACE
                gids(n)=int(n,I8)
                voll(n)=elem**3
             end do; end do; end do
@@ -273,9 +274,9 @@ module simulation
                vel(:,n)=[0.0_WP, 0.0_WP, 0.0_WP]
                flags(n)= PDC_BONDS !PDC_MOVES+PDC_INTEGRATES+PDC_BONDS !< IVM, bitwise, this should keep it still?
                if ((x0-x_c).gt.R) flags(n)=PDC_MOVES+PDC_INTEGRATES+PDC_BONDS
-               if((j.eq.1).and.((x0-x_c).gt.R)) flags(n) = PDC_MOVES+PDC_INTEGRATES+PDC_BONDS+ PDC_SURFACE
-               if((j.eq.bny).and.((x0-x_c).gt.R)) flags(n) = PDC_MOVES+PDC_INTEGRATES+PDC_BONDS + PDC_SURFACE
-               if((i.eq.bnx).and.((x0-x_c).gt.R)) flags(n) = PDC_MOVES+PDC_INTEGRATES+PDC_BONDS + PDC_SURFACE
+               if((j.le.3).and.((x0-x_c).gt.(R-ls%delta))) flags(n) = PDC_MOVES+PDC_INTEGRATES+PDC_BONDS+ PDC_SURFACE
+               if((j.ge.bny-2).and.((x0-x_c).gt.(R-ls%delta))) flags(n) = PDC_MOVES+PDC_INTEGRATES+PDC_BONDS + PDC_SURFACE
+               if((i.ge.bnx-2).and.((x0-x_c).gt.R-ls%delta)) flags(n) = PDC_MOVES+PDC_INTEGRATES+PDC_BONDS + PDC_SURFACE
                gids(n)=int(n,I8)
                voll(n)=elem**3
             end do; end do; end do
@@ -516,9 +517,7 @@ module simulation
          call time%increment()
          solid_substeps=0
       
-         if (.not.steady_state) then
-            ! Advance solid solver
-            solid: block
+         solid: block
             real(WP) :: dt_done,mydt
             ! Compute divergence of fluid stress (old way, currently not used)
             call fs%get_div_stress(divx=div_x(:,:,:),divy=div_y(:,:,:),divz=div_z(:,:,:))

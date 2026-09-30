@@ -40,6 +40,7 @@ module lsspd_class
       integer :: nown=0                        !< Number of particles in this copy
       real(WP),    allocatable :: y(:,:)       !< position, (3,nown)
       real(WP),    allocatable :: v(:,:)       !< velocity, (3,nown)
+      integer ,    allocatable :: flag(:)      !< flag,     (nown)
       real(WP),    allocatable :: ff(:,:)      !< filled locally by fluid, (3,nown)
    end type pd_copy
 
@@ -303,42 +304,6 @@ contains
 
     end subroutine update_VF
 
-   !  subroutine get_cfl(this,dt,cfl)
-   !    use mpi_f08,  only: MPI_ALLREDUCE,MPI_MAX
-   !    use parallel, only: MPI_REAL_WP
-   !    implicit none
-   !    class(lss), intent(inout) :: this
-   !    real(WP), intent(in)  :: dt
-   !    real(WP), intent(out) :: cfl
-   !    integer :: i,ierr
-   !    real(WP) :: my_CFLp_x,my_CFLp_y,my_CFLp_z,kk,mu,a
-      
-   !    ! Set the CFLs to zero
-   !    my_CFLp_x=0.0_WP; my_CFLp_y=0.0_WP; my_CFLp_z=0.0_WP
-   !    do i=1,this%nown
-   !       my_CFLp_x=max(my_CFLp_x,abs(this%v(1,i))*this%cfg%dxi(this%icell(1,i)))
-   !       my_CFLp_y=max(my_CFLp_y,abs(this%v(2,i))*this%cfg%dyi(this%icell(2,i)))
-   !       my_CFLp_z=max(my_CFLp_z,abs(this%v(3,i))*this%cfg%dzi(this%icell(3,i)))
-   !    end do
-   !    my_CFLp_x=my_CFLp_x*dt; my_CFLp_y=my_CFLp_y*dt; my_CFLp_z=my_CFLp_z*dt
-      
-   !    ! Get the parallel max
-   !    call MPI_ALLREDUCE(my_CFLp_x,this%CFLp_x,1,MPI_REAL_WP,MPI_MAX,this%cfg%comm,ierr)
-   !    call MPI_ALLREDUCE(my_CFLp_y,this%CFLp_y,1,MPI_REAL_WP,MPI_MAX,this%cfg%comm,ierr)
-   !    call MPI_ALLREDUCE(my_CFLp_z,this%CFLp_z,1,MPI_REAL_WP,MPI_MAX,this%cfg%comm,ierr)
-
-   !    ! CFL based on elastic wave speed in material
-   !    kk=this%elastic_modulus/(3.0_WP-6.0_WP*this%poisson_ratio)
-   !    mu=this%elastic_modulus/(2.0_WP+2.0_WP*this%poisson_ratio)      
-   !    a=sqrt((kk+4.0_WP*mu/3.0_WP)/this%rho)
-   !    this%CFLp_a=dt*a/this%delta
-      
-   !    ! Return the maximum CFL
-   !    cfl=max(this%CFLp_x,this%CFLp_y,this%CFLp_z,this%CFLp_a)
-      
-   ! end subroutine get_cfl
-    
-
     !> Laplacian filtering operation
     subroutine filter(this,A)
       implicit none
@@ -425,32 +390,6 @@ contains
       end do
    end subroutine update_partmesh
    
-   
-   ! !> Creation of the MPI datatype for particle ! IVM, Maybe we dont need this, since comm is handled by pdsolver?
-   ! subroutine prepare_mpi_part()
-   !    use mpi_f08
-   !    use messager, only: die
-   !    implicit none
-   !    integer(MPI_ADDRESS_KIND), dimension(part_nblock) :: disp
-   !    integer(MPI_ADDRESS_KIND) :: lb,extent
-   !    type(MPI_Datatype) :: MPI_PART_TMP
-   !    integer :: i,mysize,ierr
-   !    ! Prepare the displacement array
-   !    disp(1)=0
-   !    do i=2,part_nblock
-   !       call MPI_Type_size(part_tblock(i-1),mysize,ierr)
-   !       disp(i)=disp(i-1)+int(mysize,MPI_ADDRESS_KIND)*int(part_lblock(i-1),MPI_ADDRESS_KIND)
-   !    end do
-   !    ! Create and commit the new type
-   !    call MPI_Type_create_struct(part_nblock,part_lblock,disp,part_tblock,MPI_PART_TMP,ierr)
-   !    call MPI_Type_get_extent(MPI_PART_TMP,lb,extent,ierr)
-   !    call MPI_Type_create_resized(MPI_PART_TMP,lb,extent,MPI_PART,ierr)
-   !    call MPI_Type_commit(MPI_PART,ierr)
-   !    ! If a problem was encountered, say it
-   !    if (ierr.ne.0) call die('[lss prepare_mpi_part] MPI Particle type creation failed')
-   !    ! Get the size of this type
-   !    call MPI_type_size(MPI_PART,MPI_PART_SIZE,ierr)
-   ! end subroutine prepare_mpi_part
 
    subroutine update_fluid_location(this)
       implicit none
@@ -487,172 +426,6 @@ contains
 
    end subroutine update_fluid_location
 
-   ! subroutine share_particles(this)
-   !    use parallel, only: MPI_REAL_WP
-   !    use mpi_f08
-   !    implicit none
-
-   !    class(lss), intent(inout) :: this
-   !    integer :: i, ierr, nranks, r
-   !    integer, allocatable :: send_count(:)     ! List (nproc) of how many particles we should send
-   !    integer, allocatable :: recv_count(:)     ! List (nproc) of how many particles we should recieve
-   !    integer, allocatable :: send_disp(:)      ! Displacement for sending particles
-   !    integer, allocatable :: recv_disp(:)      ! Displacement for recieving particles
-   !    integer :: nsend, nrecv                   ! Total number of particles to send and recieve
-   !    integer :: nreq                           ! Number of required messages
-   !    integer :: first                          ! first index of the recieve buffer for a given rank, and which message we are on
-   !    integer :: q                              ! which message we are on
-   !    integer :: slot                           ! index for where the rank information starta
-   !    real(WP), allocatable :: sy(:,:), sv(:,:) ! Send buffers for position, velocity
-   !    real(WP), allocatable :: ry(:,:), rv(:,:) ! Recieve buffers for position, velocity
-   !    integer, allocatable :: stest(:), rtest(:)  ! Send and recieve buffers for testing
-   !    integer, allocatable :: next(:)                  ! Next index for sending particles to a given rank
-   !    type(MPI_Request), allocatable :: req(:)  ! MPI requests for non-blocking communication
-   !    type(MPI_Status),  allocatable :: stat(:) ! Status for the MPI requests
-   !    ! First we figure out which ranks we need to communicate with
-   !    call this%update_fluid_location() ! We update the fluid location and rank information for each particle nown
-
-   !    nranks=this%cfg%nproc
-   !    allocate(send_count(0:nranks-1), recv_count(0:nranks-1))
-   !    send_count=0
-   !    recv_count=0
-   !    do i = 1,this%nown
-   !       if (this%flag(i).eq.PDC_IS_DEAD) cycle
-   !       send_count(this%fluid_rank(i)) = send_count(this%fluid_rank(i)) + 1 ! count up how many particles need to get passed along 
-   !    end do
-
-   !    ! Now we populate the recv_count array by doing an all-to-all communication (only 1)
-
-   !    call MPI_ALLTOALL(send_count,1,MPI_INTEGER, &
-   !                    & recv_count,1,MPI_INTEGER, &
-   !                    & this%cfg%comm,ierr)
-
-   !    ! now everyone knows who they are recieving from and how many particles to get
-   !    ! now we size the recieve buffers to fit the amount of information and number of particles
-
-   !    ! Total number of particle to send and recieve on this rank
-   !    nsend = sum(send_count)
-   !    nrecv = sum(recv_count)
-
-   !    ! track the displacement needed for each rank for sending and recieving
-   !    allocate(send_disp(0:nranks-1), recv_disp(0:nranks-1))
-   !    send_disp(0)=0; recv_disp(0)=0
-   !    do r=1,nranks-1
-   !       ! displacement for the contigous send and recieve buffers
-   !       ! we start at 0 on the 0th index, then add the number of particles to send
-   !       ! we then start the nexxt rank at the previous displacement plus the number of particles to send from that rank
-   !       ! e.g. if rank 0 is sending 3 particles, then rank 1 will start at index 3 in the send buffer, 
-   !       ! and if rank 1 is sending 5 particles, then rank 2 will start at index 8 in the send buffer
-   !       send_disp(r) = send_disp(r-1) + send_count(r-1)
-   !       ! Same process for the recieve buffer
-   !       recv_disp(r) = recv_disp(r-1) + recv_count(r-1)
-   !    end do
-
-   !    ! since we have different data types we are communicating, we need to allocate buffers for each tyep'
-   !    allocate(stest(max(nsend,1)),rtest(max(nrecv,1)))    ! Global id buffers
-   !    allocate(sy(3,max(nsend,1)),ry(3,max(nrecv,1)))    ! position buffers
-   !    allocate(sv(3,max(nsend,1)),rv(3,max(nrecv,1)))    ! velocity buffers
-
-   !    nreq=3*(count(recv_count.gt.0) + count(send_count.gt.0)) ! number of required messages
-
-   !    if(nreq.gt.0) then
-   !       allocate(req(nreq),stat(nreq)) ! allocating status and request arrays for the number of messages
-   !       q=0 ! which message we are on
-
-   !       do r=0,nranks-1
-   !          if (recv_count(r).eq.0) cycle
-
-   !          first=recv_disp(r)+1 ! first index of the recieve buffer for a given rank
-
-   !          ! Setup recieve buffer for position
-   !          q=q+1
-   !          call MPI_IRECV(ry(1,first),3*recv_count(r),MPI_REAL_WP, & ! multiply by three since vector
-   !          &              r,TAG_PARTICLE_Y,this%cfg%comm,req(q),ierr)
-
-   !          ! Setup recieve buffer for velocity
-   !          q=q+1
-   !          call MPI_IRECV(rv(1,first),3*recv_count(r),MPI_REAL_WP, & ! mutliply by three since vector
-   !          &              r,TAG_PARTICLE_V,this%cfg%comm,req(q),ierr)
-
-   !          ! Setup test buffer for comms testing
-   !          q=q+1
-   !          call MPI_IRECV(rtest(first),recv_count(r),MPI_INTEGER, & ! mutliply by three since vector
-   !          &              r,TAG_PARTICLE_TEST,this%cfg%comm,req(q),ierr)
-   !       end do
-   !    end if 
-
-   !    ! Now we pack the message
-   !   allocate(next(0:nranks-1))
-   !   next=send_disp
-   !    do i = 1,this%nown
-   !       if (this%flag(i).eq.PDC_IS_DEAD) cycle
-   !       r=this%fluid_rank(i) !which rank are we sending to
-
-   !       next(r)=next(r)+1 ! we +1 this to put the particles one after 
-   !                         ! the next for this rank (if we didn't we would 
-   !                         ! overwrite the previous particle for this rank in the send buffer)
-   !       slot = next(r) ! we 1 index for the this% but 0 index for the send_disp
-   !       sy(:,slot)=this%y(:,i)
-   !       sv(:,slot)=this%v(:,i)
-   !       stest(slot)=this%which_rank(i)
-   !    end do
-   !    deallocate(next)
-
-   !    if(nreq.gt.0) then
-   !       ! Now we send the messages
-   !       do r=0,nranks-1
-   !          if (send_count(r).eq.0) cycle
-
-   !          first=send_disp(r)+1 ! first index of the send buffer for a given rank
-
-   !          ! Setup send buffer for position
-   !          q=q+1
-   !          call MPI_ISEND(sy(1,first),3*send_count(r),MPI_REAL_WP, &
-   !          &              r,TAG_PARTICLE_Y,this%cfg%comm,req(q),ierr)
-
-   !          ! Setup send buffer for velocity
-   !          q=q+1
-   !          call MPI_ISEND(sv(1,first),3*send_count(r),MPI_REAL_WP, &
-   !          &              r,TAG_PARTICLE_V,this%cfg%comm,req(q),ierr)
-
-   !          q=q+1
-   !          call MPI_ISEND(stest(first),send_count(r),MPI_INTEGER, & 
-   !          &              r,TAG_PARTICLE_TEST,this%cfg%comm,req(q),ierr)
-   !       end do
-
-         
-   !    end if
-
-   !    if (nreq.gt.0) then
-   !       if (q.ne.nreq) then
-   !          error stop '[share_particles] MPI request count mismatch'
-   !       end if
-
-   !       call MPI_WAITALL(nreq,req,stat,ierr) ! make sure everyone has done their sending and recieving
-
-   !       deallocate(req,stat)
-   !    end if
-
-   !    do r=0,nranks-1
-   !       if (recv_count(r).eq.0) cycle
-
-   !       first=recv_disp(r)+1
-
-   !       ! The block came from rank r, so every value should equal r.
-   !       if (any(rtest(first:first+recv_count(r)-1).ne.r)) then
-   !          write(*,*) 'Rank ',this%cfg%rank, &
-   !          &          ' received incorrect test data from rank ',r
-   !          error stop '[share_particles] which_rank test failed'
-   !       end if
-   !    end do
-
-   !    write(*,*) 'Rank ',this%cfg%rank, &
-   !    &          ': particle communication test passed; received ',nrecv
-
-      
-    
-   ! end subroutine share_particles
-
    ! Sends out particles accross ranks to those who own them for computing fluid forces on the particles
    ! Also needed to update volume fractions
    subroutine fluid_sync(this,d_stress_x,d_stress_y,d_stress_z)
@@ -671,6 +444,8 @@ contains
       integer, allocatable :: next(:)
       integer, allocatable :: send_lid(:) ! local id of the send (needed for the return trip)
       real(WP), allocatable :: send_yv(:,:), recv_yv(:,:), recv_ff(:,:)
+      integer, allocatable :: send_flag(:), recv_flag(:)
+      real(WP) :: dt_f ! Fluid time step size
       ! Maybe we do this seperatately instead of tying it in?
       call this%update_fluid_location() ! We update the fluid location and rank information for each particle nown
 
@@ -699,8 +474,12 @@ contains
       ! Pack message
       allocate(send_yv(6,max(nsend,1)))
       allocate(recv_yv(6,max(nrecv,1)))
+      allocate(send_flag(max(nsend,1)))
+      allocate(recv_flag(max(nrecv,1)))
       send_yv=0.0_WP
       recv_yv=0.0_WP
+      send_flag=0
+      recv_flag=0
       allocate(next(0:nranks-1))
       next=send_disp ! cursor
       ! setup local map
@@ -719,6 +498,7 @@ contains
          ! the send information in the same way if we construct the recieve buffer the same
          send_yv(1:3,column) = this%y(:,i)
          send_yv(4:6,column) = this%v(:,i)
+         send_flag(column) = this%flag(i)
          ! save the local id for the way back
          send_lid(column)=i
       end do
@@ -738,6 +518,9 @@ contains
       call MPI_ALLTOALLV(send_yv,send_count*6,send_disp*6,MPI_REAL_WP, &
                         recv_yv,recv_count*6,recv_disp*6,MPI_REAL_WP, &
                         this%cfg%comm,ierr)
+      call MPI_ALLTOALLV(send_flag,send_count,send_disp,MPI_INTEGER, &
+                        recv_flag,recv_count,recv_disp,MPI_INTEGER, &
+                        this%cfg%comm,ierr)
       
       ! now recv_yv has all the particles that this processor needed, which we need to reconstruct
       ! clear out the existing copies
@@ -748,15 +531,22 @@ contains
       if (allocated(this%fluid_copy%v)) then
          deallocate(this%fluid_copy%v)
       end if
+
+      if (allocated(this%fluid_copy%flag)) then
+         deallocate(this%fluid_copy%flag)
+      end if
       this%fluid_copy%nown=nrecv
       allocate(this%fluid_copy%y(3,max(nrecv,1)))
       allocate(this%fluid_copy%v(3,max(nrecv,1)))
+      allocate(this%fluid_copy%flag(max(nrecv,1)))
       this%fluid_copy%y=0.0_WP
       this%fluid_copy%v=0.0_WP
+      this%fluid_copy%flag=0
 
       if (nrecv.gt.0) then
          this%fluid_copy%y(:,1:nrecv)=recv_yv(1:3,1:nrecv)
          this%fluid_copy%v(:,1:nrecv)=recv_yv(4:6,1:nrecv)
+         this%fluid_copy%flag(1:nrecv)=recv_flag(1:nrecv)
       end if
 
       ! I think if we are careful about the order of nown we send and recieve, and keep it identically the same
@@ -765,8 +555,8 @@ contains
       if (allocated(this%fluid_copy%ff)) then
          deallocate(this%fluid_copy%ff)
       end if
-      allocate(this%fluid_copy%ff(3,max(nrecv,1)))
-      ! this%fluid_copy%ff=0.0_WP
+         
+      allocate(this%fluid_copy%ff(3,max(nrecv,1))); this%fluid_copy%ff=0.0_WP;
       call this%update_VF()
       call this%compute_fluid_forces(stress_x=d_stress_x,stress_y=d_stress_y,stress_z=d_stress_z)
 
@@ -785,7 +575,7 @@ contains
          this%ff(:,i)=recv_ff(:,column)
       end do
       deallocate(next)
-      deallocate(send_yv,recv_yv)
+      deallocate(send_yv,recv_yv,send_flag,recv_flag)
       deallocate(send_count,recv_count)
       deallocate(recv_ff,send_lid)
 
@@ -803,6 +593,7 @@ contains
       integer, allocatable :: send_disp(:), recv_disp(:)
       integer, allocatable :: next(:)
       real(WP), allocatable :: send_yv(:,:), recv_yv(:,:)
+      integer, allocatable :: send_flag(:), recv_flag(:)
       ! Maybe we do this seperatately instead of tying it in?
       call this%update_fluid_location() ! We update the fluid location and rank information for each particle nown
 
@@ -831,8 +622,12 @@ contains
       ! Pack message
       allocate(send_yv(6,max(nsend,1)))
       allocate(recv_yv(6,max(nrecv,1)))
+      allocate(send_flag(max(nsend,1)))
+      allocate(recv_flag(max(nrecv,1)))
       send_yv=0.0_WP
       recv_yv=0.0_WP
+      send_flag=0
+      recv_flag=0
       allocate(next(0:nranks-1))
       next=send_disp ! cursor
       ! pack up the send buffer
@@ -848,7 +643,7 @@ contains
          ! the send information in the same way if we construct the recieve buffer the same
          send_yv(1:3,column) = this%y(:,i)
          send_yv(4:6,column) = this%v(:,i)
-         ! save the local id for the way back
+         send_flag(column) = this%flag(i)
       end do
       !    MPI_Alltoallv(
       !    sendbuf,        Starting address of the send buffer in memory
@@ -866,6 +661,9 @@ contains
       call MPI_ALLTOALLV(send_yv,send_count*6,send_disp*6,MPI_REAL_WP, &
                         recv_yv,recv_count*6,recv_disp*6,MPI_REAL_WP, &
                         this%cfg%comm,ierr)
+      call MPI_ALLTOALLV(send_flag,send_count,send_disp,MPI_INTEGER, &
+                        recv_flag,recv_count,recv_disp,MPI_INTEGER, &
+                        this%cfg%comm,ierr)
       
       ! now recv_yv has all the particles that this processor needed, which we need to reconstruct
       ! clear out the existing copies
@@ -876,15 +674,22 @@ contains
       if (allocated(this%fluid_copy%v)) then
          deallocate(this%fluid_copy%v)
       end if
+
+      if (allocated(this%fluid_copy%flag)) then
+         deallocate(this%fluid_copy%flag)
+      end if
       this%fluid_copy%nown=nrecv
       allocate(this%fluid_copy%y(3,max(nrecv,1)))
       allocate(this%fluid_copy%v(3,max(nrecv,1)))
+      allocate(this%fluid_copy%flag(max(nrecv,1)))
       this%fluid_copy%y=0.0_WP
       this%fluid_copy%v=0.0_WP
+      this%fluid_copy%flag=0
 
       if (nrecv.gt.0) then
          this%fluid_copy%y(:,1:nrecv)=recv_yv(1:3,1:nrecv)
          this%fluid_copy%v(:,1:nrecv)=recv_yv(4:6,1:nrecv)
+         this%fluid_copy%flag(1:nrecv)=recv_flag(1:nrecv)
       end if
 
       ! I think if we are careful about the order of nown we send and recieve, and keep it identically the same
@@ -893,7 +698,7 @@ contains
       call this%update_VF()
 
       deallocate(next)
-      deallocate(send_yv,recv_yv)
+      deallocate(send_yv,recv_yv,send_flag,recv_flag)
       deallocate(send_count,recv_count)
 
    end subroutine update_fluid_sync
