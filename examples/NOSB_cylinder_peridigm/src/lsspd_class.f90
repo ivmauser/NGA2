@@ -58,6 +58,9 @@ module lsspd_class
       real(WP), dimension(:,:,:), allocatable :: VFU      !< Solid velocity, U-face
       real(WP), dimension(:,:,:), allocatable :: VFV      !< Solid velocity, V-face
       real(WP), dimension(:,:,:), allocatable :: VFW      !< Solid velocity, W-face
+      real(WP), dimension(:,:,:), allocatable :: srcU     !< U momentum source on mesh, cell-centered
+      real(WP), dimension(:,:,:), allocatable :: srcV     !< V momentum source on mesh, cell-centered
+      real(WP), dimension(:,:,:), allocatable :: srcW     !< W momentum source on mesh, cell-centered
       
        ! CFL numbers
       real(WP) :: CFLp_x,CFLp_y,CFLp_z,CFLp_a
@@ -147,6 +150,11 @@ contains
       allocate(self%VFU(self%cfg%imino_:self%cfg%imaxo_,self%cfg%jmino_:self%cfg%jmaxo_,self%cfg%kmino_:self%cfg%kmaxo_)); self%VFU=0.0_WP
       allocate(self%VFV(self%cfg%imino_:self%cfg%imaxo_,self%cfg%jmino_:self%cfg%jmaxo_,self%cfg%kmino_:self%cfg%kmaxo_)); self%VFV=0.0_WP
       allocate(self%VFW(self%cfg%imino_:self%cfg%imaxo_,self%cfg%jmino_:self%cfg%jmaxo_,self%cfg%kmino_:self%cfg%kmaxo_)); self%VFW=0.0_WP
+
+      allocate(self%srcU(self%cfg%imino_:self%cfg%imaxo_,self%cfg%jmino_:self%cfg%jmaxo_,self%cfg%kmino_:self%cfg%kmaxo_)); self%srcU=0.0_WP
+      allocate(self%srcV(self%cfg%imino_:self%cfg%imaxo_,self%cfg%jmino_:self%cfg%jmaxo_,self%cfg%kmino_:self%cfg%kmaxo_)); self%srcV=0.0_WP
+      allocate(self%srcW(self%cfg%imino_:self%cfg%imaxo_,self%cfg%jmino_:self%cfg%jmaxo_,self%cfg%kmino_:self%cfg%kmaxo_)); self%srcW=0.0_WP
+
 
       ! Allocate finite volume divergence operators
       allocate(self%div_x(0:+1,self%cfg%imin_:self%cfg%imax_,self%cfg%jmin_:self%cfg%jmax_,self%cfg%kmin_:self%cfg%kmax_)) !< Cell-centered
@@ -428,7 +436,7 @@ contains
 
    ! Sends out particles accross ranks to those who own them for computing fluid forces on the particles
    ! Also needed to update volume fractions
-   subroutine fluid_sync(this,d_stress_x,d_stress_y,d_stress_z)
+   subroutine fluid_sync(this,dt_s,rho_f,d_stress_x,d_stress_y,d_stress_z)
       use parallel, only: MPI_REAL_WP
       use mpi_f08
       implicit none
@@ -445,7 +453,7 @@ contains
       integer, allocatable :: send_lid(:) ! local id of the send (needed for the return trip)
       real(WP), allocatable :: send_yv(:,:), recv_yv(:,:), recv_ff(:,:)
       integer, allocatable :: send_flag(:), recv_flag(:)
-      real(WP) :: dt_f ! Fluid time step size
+      real(WP) :: dt_s,rho_f ! Fluid time step size
       ! Maybe we do this seperatately instead of tying it in?
       call this%update_fluid_location() ! We update the fluid location and rank information for each particle nown
 
@@ -558,7 +566,7 @@ contains
          
       allocate(this%fluid_copy%ff(3,max(nrecv,1))); this%fluid_copy%ff=0.0_WP;
       call this%update_VF()
-      call this%compute_fluid_forces(stress_x=d_stress_x,stress_y=d_stress_y,stress_z=d_stress_z)
+      call this%compute_fluid_forces(dt_s,rho_f,d_stress_x,d_stress_y,d_stress_z)
 
       ! Back the way we came
       allocate(recv_ff(3,max(nsend,1)))
@@ -704,29 +712,37 @@ contains
    end subroutine update_fluid_sync
 
    ! Compute fluid forces acting on fluid_copy particles on each rank
-   subroutine compute_fluid_forces(this,stress_x,stress_y,stress_z)
+   subroutine compute_fluid_forces(this,dt_s,rho_f,stress_x,stress_y,stress_z)
       implicit none
       class(lss), intent(inout) :: this
       real(WP), dimension(this%cfg%imino_:,this%cfg%jmino_:,this%cfg%kmino_:), intent(inout) :: stress_x  !< Needs to be (imino_:imaxo_,jmino_:jmaxo_,kmino_:kmaxo_)
       real(WP), dimension(this%cfg%imino_:,this%cfg%jmino_:,this%cfg%kmino_:), intent(inout) :: stress_y  !< Needs to be (imino_:imaxo_,jmino_:jmaxo_,kmino_:kmaxo_)
       real(WP), dimension(this%cfg%imino_:,this%cfg%jmino_:,this%cfg%kmino_:), intent(inout) :: stress_z  !< Needs to be (imino_:imaxo_,jmino_:jmaxo_,kmino_:kmaxo_)
+      real(WP), intent(in) :: dt_s, rho_f
       integer :: n,ierr
+      real(WP):: const
       real(WP), dimension(3) :: stress
       integer, dimension(3) :: idx
       ! Assumes that we have already shared copies and particle locations with ranks
       idx = 0
+      const = dt_s/rho_f
       ! Compute the fluid forces on each particle using the copied particles we have
       do n=1,this%fluid_copy%nown
          ! Advance with Verlet scheme
-         
+         ! if (iand(this%fluid_copy%flag(n),PDC_SURFACE).eq.0) cycle
          idx = this%cfg%get_ijk_global(this%fluid_copy%y(:,n),idx) ! is this slow? should we store it?
+         ! This term is the divergence of stress
          this%fluid_copy%ff(:,n)=this%cfg%get_velocity(pos=this%fluid_copy%y(:,n),i0=idx(1),j0=idx(2),k0=idx(3),U=stress_x,V=stress_y,W=stress_z)!  - this%fluid_copy%v(:,n)
-         
-
-         ! we will divide by rho later
+         ! We now need to send it back to the grid as we got it
+         call this%cfg%set_scalar(Sp=-this%dV*this%fluid_copy%ff(1,n)*const, pos=this%fluid_copy%y(:,n),i0=idx(1),j0=idx(2),k0=idx(3),S=this%srcU,bc='n')
+         call this%cfg%set_scalar(Sp=-this%dV*this%fluid_copy%ff(2,n)*const, pos=this%fluid_copy%y(:,n),i0=idx(1),j0=idx(2),k0=idx(3),S=this%srcV,bc='n')
+         call this%cfg%set_scalar(Sp=-this%dV*this%fluid_copy%ff(3,n)*const, pos=this%fluid_copy%y(:,n),i0=idx(1),j0=idx(2),k0=idx(3),S=this%srcW,bc='n')
 
       end do
-   
+      call this%cfg%syncsum(this%srcU)
+      call this%cfg%syncsum(this%srcV)
+      call this%cfg%syncsum(this%srcW)
+
    end subroutine compute_fluid_forces 
    
 end module lsspd_class
