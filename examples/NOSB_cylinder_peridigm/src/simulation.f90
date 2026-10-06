@@ -42,10 +42,14 @@ module simulation
    real(WP), dimension(:,:,:), allocatable :: Ui,Vi,Wi
    real(WP), dimension(:,:,:), allocatable :: Uib,Vib,Wib,srcM
    real(WP), dimension(:,:,:,:,:), allocatable :: gradU
+   real(WP), dimension(3) :: ibmForce=0.0_WP
 
    !> Max timestep size for solid solver
-   real(WP) :: ls_dt,ls_dt_max
+   real(WP) :: ls_dt,ls_dt_max,ls_cfl_max
    integer :: solid_substeps = 0
+
+   !> Problem dimensions for BC inlet
+   real(WP) :: Uin, Ly, R, width
 
    !> Steady state evolution boolean
    logical :: steady_state = .false.
@@ -88,6 +92,7 @@ module simulation
         time=timetracker(amRoot=cfg%amRoot)
         call param_read('Max timestep size',time%dtmax)
         call param_read('Max cfl number',time%cflmax)
+        call param_read('Max solid cfl number',ls_cfl_max,default=time%cflmax)
         call param_read('Max time',time%tmax)
         time%dt=time%dtmax
         time%itmax=2
@@ -158,8 +163,8 @@ module simulation
          real(WP), allocatable :: pos(:,:),vel(:,:),voll(:),rpos(:,:),rvel(:,:),rvol(:)
          integer, allocatable :: flags(:),owner(:),rflag(:)
          integer :: i,j,k,n,nn,nr,nx,ny,nz,N_r,N_z,bnx,bny
-         real(WP) :: dx,x0,y0,z0,Beam_L,Beam_H,Lx,Ly,Lz,x_c,y_c,a,b
-         real(WP) :: R, R_int
+         real(WP) :: dx,x0,y0,z0,Beam_L,Beam_H,Lx,Lz,x_c,y_c,a,b
+         real(WP) ::  R_int
          real(WP) :: rho,E,nu,elem,delta
 
          ls=lss(cfg=cfg,name='solid')
@@ -176,6 +181,7 @@ module simulation
          call param_read('b',b,default=0.02_WP)       ! Width of beam
          ! need to define an elem value
          elem=R/(3.0_WP*real(N_r,WP))
+         width = elem
          ls%delta=elem*3.01_WP ! 3 times the elem value should be the grid spacing
          call param_read('Material density',ls%rho)
          call param_read('Elastic modulus', ls%elastic_modulus,default=2.0e11_WP)
@@ -196,9 +202,9 @@ module simulation
          if(cfg%nz.eq.1) ls%collapsed(3)=.true.
          if (restarted) then
             call ls%read_state(dirname=trim(restart_dir))
-            ! do i=1,ls%nown
-            !    if(ls%flag(i).eq.PDC_BONDS+PDC_MOVES) ls%flag(i)=PDC_BONDS+PDC_MOVES+PDC_INTEGRATES
-            ! end do         
+            do i=1,ls%nown
+                if(ls%flag(i).eq.PDC_MOVES+PDC_INTEGRATES+PDC_BONDS) ls%flag(i)=PDC_MOVES+PDC_INTEGRATES+PDC_BONDS+PDC_SURFACE ! sets everyone who was stationary to also have the fluid force
+             end do         
          else
             nx = 2*N_r*3
             ny = 2*N_r*3
@@ -224,17 +230,6 @@ module simulation
                   y0 = (real(j,WP) - 0.5_WP*real(ny+1,WP))*elem + y_c
                   z0 = (real(k,WP) - 0.5_WP*real(nz+1,WP))*elem
                   if (((x0-x_c)*(x0-x_c) + (y0-y_c)*(y0-y_c)).ge.R*R) cycle;
-                  if (((x0-x_c)*(x0-x_c) + (y0-y_c)*(y0-y_c)).le.R_int*R_int) cycle;
-                  if (((x0-x_c).gt.0.0_WP).and.(abs(y0-y_c).le.Beam_H/2.0_WP)) cycle;
-                  nn=nn+1
-               end do; end do; end do
-
-               ! Beam
-               do k=1,nz; do j=1,bny; do i=1,bnx
-                  x0 = (real(i,WP) - 0.5_WP*real(bnx+1,WP))*elem + Beam_L/2.0_WP + x_c
-                  y0 = (real(j,WP) - 0.5_WP*real(bny+1,WP))*elem + y_c
-                  z0 = (real(k,WP) - 0.5_WP*real(nz+1,WP))*elem
-                  ! if (((x0)*(x0) + y0*y0).le.R*R) cycle;
                   nn=nn+1
                end do; end do; end do
 
@@ -250,44 +245,20 @@ module simulation
                y0 = (real(j,WP) - 0.5_WP*real(ny+1,WP))*elem + y_c
                z0 = (real(k,WP) - 0.5_WP*real(nz+1,WP))*elem
                if (((x0-x_c)*(x0-x_c) + (y0-y_c)*(y0-y_c)).ge.R*R) cycle;
-               if (((x0-x_c)*(x0-x_c) + (y0-y_c)*(y0-y_c)).le.R_int*R_int) cycle;
-               if (((x0-x_c).gt.0.0_WP).and.(abs(y0-y_c).le.Beam_H/2.0_WP)) cycle;
+
                n=n+1
                pos(:,n)=[x0, y0, z0]
                vel(:,n)=[0.0_WP, 0.0_WP, 0.0_WP]
-               flags(n)= PDC_BONDS ! PDC_MOVES+PDC_INTEGRATES+PDC_BONDS !< IVM, bitwise, this should keep it still?
+               flags(n)= PDC_BONDS ! + PDC_SURFACE! PDC_MOVES+PDC_INTEGRATES+PDC_BONDS !< IVM, bitwise, this should keep it still?
                if (((x0-x_c)*(x0-x_c) + (y0-y_c)*(y0-y_c)).ge.(R-ls%delta)*(R-ls%delta)) flags(n)= PDC_BONDS + PDC_SURFACE
                gids(n)=int(n,I8)
                voll(n)=elem**3
             end do; end do; end do
             print*, n
-
-         
-            do k=1,nz; do j=1,bny; do i=1,bnx
-               if (.not.amRoot) exit
-               x0 = (real(i,WP) - 0.5_WP*real(bnx+1,WP))*elem + Beam_L/2.0_WP + x_c
-               y0 = (real(j,WP) - 0.5_WP*real(bny+1,WP))*elem + y_c
-               z0 = (real(k,WP) - 0.5_WP*real(nz+1,WP))*elem
-               ! if (((x0)*(x0) + y0*y0).le.R*R) cycle;
-               n=n+1
-               pos(:,n)=[x0, y0, z0]
-               vel(:,n)=[0.0_WP, 0.0_WP, 0.0_WP]
-               flags(n)= PDC_BONDS !PDC_MOVES+PDC_INTEGRATES+PDC_BONDS !< IVM, bitwise, this should keep it still?
-               if ((x0-x_c).gt.R) flags(n)=PDC_MOVES+PDC_INTEGRATES+PDC_BONDS
-               if((j.le.3).and.((x0-x_c).gt.(R-ls%delta))) flags(n) = PDC_MOVES+PDC_INTEGRATES+PDC_BONDS+ PDC_SURFACE
-               if((j.ge.bny-2).and.((x0-x_c).gt.(R-ls%delta))) flags(n) = PDC_MOVES+PDC_INTEGRATES+PDC_BONDS + PDC_SURFACE
-               if((i.ge.bnx-2).and.((x0-x_c).gt.R-ls%delta)) flags(n) = PDC_MOVES+PDC_INTEGRATES+PDC_BONDS + PDC_SURFACE
-               gids(n)=int(n,I8)
-               voll(n)=elem**3
-            end do; end do; end do
             call pd_partition(nn,gids,pos,vel,flags,voll,owner,nr,rgid,rpos,rvel,rflag,rvol)
             call ls%set_nodes(nr,rgid,rpos,rvel,rflag,rvol)
             call ls%detect_families()
          end if
-         
-         
-         
-
          ! COMMS TEST
          allocate(ls%which_rank(ls%nown))
          ls%which_rank = ls%cfg%rank
@@ -346,7 +317,6 @@ module simulation
          use incomp_class, only: bcond
          type(bcond), pointer :: mybc
          integer :: n,i,j,k
-         real(WP) :: Uin, Ly
          ! Read inflow velocity
          call param_read('Inlet velocity',Uin)
          call param_read('Ly',Ly)
@@ -371,7 +341,7 @@ module simulation
             do k=fs%cfg%kmin_,fs%cfg%kmax_
                   do j=fs%cfg%jmin_,fs%cfg%jmax_
                      do i=fs%cfg%imin_,fs%cfg%imax_
-                        fs%U(i,j,k)=0.0_WP
+                        fs%U(i,j,k)=Uin
                         fs%V(i,j,k)=0.0_WP
                         fs%W(i,j,k)=0.0_WP
                   end do
@@ -385,7 +355,7 @@ module simulation
          call fs%get_bcond('inflow',mybc)
          do n=1,mybc%itr%no_
             i=mybc%itr%map(1,n); j=mybc%itr%map(2,n); k=mybc%itr%map(3,n)
-            fs%U(i,j,k)=6.0_WP * Uin * cfg%ym(j)*(Ly -cfg%ym(j))/Ly**2 
+            fs%U(i,j,k)=Uin ! 6.0_WP * Uin * cfg%ym(j)*(Ly -cfg%ym(j))/Ly**2 
          end do
          ! Compute MFR through all boundary conditions
          call fs%get_mfr()
@@ -467,9 +437,9 @@ module simulation
         call sfile%add_column(ls%Vmax,'Particle Vmax')
         call sfile%add_column(ls%Wmin,'Particle Wmin')
         call sfile%add_column(ls%Wmax,'Particle Wmax')       
-      !   call sfile%add_column(ls%ibmForce(1),'Particle Fx')
-      !   call sfile%add_column(ls%ibmForce(2),'Particle Fy')
-      !   call sfile%add_column(ls%ibmForce(3),'Particle Fz')
+        call sfile%add_column(ibmForce(1),'Particle Fx')
+        call sfile%add_column(ibmForce(2),'Particle Fy')
+        call sfile%add_column(ibmForce(3),'Particle Fz')
         call sfile%write()
 
         ! Create solid timing monitor
@@ -527,7 +497,7 @@ module simulation
                ! call fs%get_div_stress(divx=div_x(:,:,:),divy=div_y(:,:,:),divz=div_z(:,:,:))
                ! Sub-iteratore
                call ls%get_cfl(ls_dt,cfl=solid_cfl)
-               if (solid_cfl.gt.0.0_WP) ls_dt=min(ls_dt*time%cflmax/solid_cfl,ls_dt_max)
+               if (solid_cfl.gt.0.0_WP) ls_dt=min(ls_dt*ls_cfl_max/solid_cfl,ls_dt_max)
                dt_done=0.0_WP
                
                do while (dt_done.lt.time%dtmid)
@@ -537,10 +507,7 @@ module simulation
                   call ls%fluid_sync(dt_f=time%dtmid,fvel_x=fs%U,fvel_y=fs%V,fvel_z=fs%W) 
                   call ls%advance(dt      =mydt,& 
                   &               fluid_dt=time%dtmid,&
-                  &               fluid_rho=fs%rho) !,&
-                  !   &               div_stress_x=fs%U(:,:,:),&
-                  !   &               div_stress_y=fs%V(:,:,:),&
-                  !   &               div_stress_z=fs%W(:,:,:))
+                  &               fluid_rho=fs%rho)
                   ! Increment
                   dt_done=dt_done+mydt
                   if(cfg%amRoot) solid_substeps=solid_substeps+1
@@ -653,6 +620,23 @@ module simulation
             
             ! Apply other boundary conditions
             call fs%apply_bcond(time%t,time%dtmid)
+            dirichlet_velocity: block
+               use incomp_class, only: bcond
+               use mathtools, only: Pi
+               type(bcond), pointer :: mybc
+               integer :: n,i,j,k
+               call fs%get_bcond("inflow",mybc)
+               do n=1,mybc%itr%no_
+                  i=mybc%itr%map(1,n); j=mybc%itr%map(2,n); k=mybc%itr%map(3,n)
+                  if(time%t.lt.1.0_WP) then
+                     ! fs%U(i,j,k)=(6.0_WP * Uin * cfg%ym(j)*(Ly -cfg%ym(j))/Ly**2)*(1.0_WP - cos(pi/2.0_WP*time%t))/2.0_WP 
+                     fs%U(i,j,k)=Uin! Uin*(1.0_WP - cos(pi/1.0_WP*time%t))/2.0_WP 
+                  else
+                     ! fs%U(i,j,k)=(6.0_WP * Uin * cfg%ym(j)*(Ly -cfg%ym(j))/Ly**2)
+                     fs%U(i,j,k)=Uin
+                  end if
+               end do
+            end block dirichlet_velocity
 
             ! Solve Poisson equation
             ! call fs%correct_mfr(src=srcM)
@@ -725,6 +709,7 @@ module simulation
             end block save_restart
          end if
 
+         call get_particle_force()
          ! ! Perform and output monitoring
          call ls%get_info()
          call fs%get_max()
@@ -752,6 +737,20 @@ module simulation
       deallocate(div_x,div_y,div_z,resU,resV,resW,Ui,Vi,Wi,Uib,Vib,Wib,srcM,gradU)
       
    end subroutine simulation_final
+
+   subroutine get_particle_force
+      use parallel, only: comm,MPI_REAL_WP
+      use mpi_f08,  only: MPI_ALLREDUCE,MPI_SUM,MPI_IN_PLACE
+      implicit none
+      integer :: i,ierr
+      ibmForce=0.0_WP
+      do i=1,ls%nown
+         ibmForce=ls%ff(:,i)*fs%rho*ls%dV + ibmForce 
+      end do 
+
+      call MPI_ALLREDUCE(MPI_IN_PLACE,ibmForce,3,MPI_REAL_WP,MPI_SUM,comm,ierr)
+      ibmForce = ibmForce/(R*fs%rho*Uin**2*width)
+   end subroutine get_particle_force
    
    
 end module simulation

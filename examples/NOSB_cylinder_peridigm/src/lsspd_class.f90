@@ -730,7 +730,7 @@ contains
       ! Compute the fluid forces on each particle using the copied particles we have
       do n=1,this%fluid_copy%nown
          ! Advance with Verlet scheme
-         if (iand(this%fluid_copy%flag(n),PDC_SURFACE).eq.0) cycle
+         ! if (iand(this%fluid_copy%flag(n),PDC_SURFACE).eq.0) cycle
          idx = this%cfg%get_ijk_global(this%fluid_copy%y(:,n),idx) ! is this slow? should we store it?
          ! Interpolate fluid velocity to particle location
          vel = 0.0_WP
